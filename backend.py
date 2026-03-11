@@ -16,7 +16,7 @@ ANTHROPIC_API_KEY = "sk-ant-YOUR_ACTUAL_KEY"
 MONGO_URI         = "mongodb+srv://Aero-fit:AKARyan@cluster0.6qfrbja.mongodb.net/"
 MONGO_DB          = "aerofit"
 GMAIL_USER        = "aerofityou@gmail.com"
-GMAIL_APP_PASS    = "epqp dhgp tmnb bmus"
+GMAIL_APP_PASS    = "ofcy ihro xjxd oocr"
 
 app = FastAPI(title="AERO-FIT API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
