@@ -220,5 +220,4 @@ def generate_outfit(req: OutfitRequest):
 
 if __name__ == "__main__":
     import uvicorn
-uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
-ENDOFFILE
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
