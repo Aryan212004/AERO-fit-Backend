@@ -293,11 +293,24 @@ def create_banner(req: BannerCreate):
 
 @app.get("/banners")
 def list_banners(screen: str = None):
-    q = db.collection("banners").order_by(
-        "created_at", direction=firestore.Query.DESCENDING)
+    docs = db.collection("banners").stream()
+    banners = [{"id": d.id, **d.to_dict()} for d in docs]
+    
+    # Filter and sort in Python instead of Firestore query
     if screen:
-        q = q.where("screen", "==", screen)
-    return [{"id": d.id, **d.to_dict()} for d in q.stream()]
+        banners = [b for b in banners if b.get("screen") == screen]
+    
+    # Sort by created_at descending in Python
+    def sort_key(b):
+        ca = b.get("created_at")
+        if ca is None:
+            return 0
+        if hasattr(ca, "timestamp"):   # Firestore Timestamp
+            return ca.timestamp()
+        return 0
+    
+    banners.sort(key=sort_key, reverse=True)
+    return banners
 
 
 @app.delete("/banners/{banner_id}")
@@ -549,10 +562,19 @@ def get_meals(email: str, days: int = 1):
         db.collection("meals")
           .where("email",     "==", email.lower())
           .where("logged_at", ">=", since)
-          .order_by("logged_at", direction=firestore.Query.DESCENDING)
           .stream()
     )
-    return [{"id": d.id, **d.to_dict()} for d in docs]
+    meals = [{"id": d.id, **d.to_dict()} for d in docs]
+    
+    # Sort in Python instead
+    def sort_key(m):
+        la = m.get("logged_at")
+        if la is None: return 0
+        if hasattr(la, "timestamp"): return la.timestamp()
+        return 0
+    
+    meals.sort(key=sort_key, reverse=True)
+    return meals
 
 
 @app.delete("/meal/{meal_id}")
