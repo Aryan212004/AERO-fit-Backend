@@ -26,51 +26,61 @@ def _require(key: str) -> str:
         sys.exit(1)
     return val
 
-GEMINI_API_KEY  = _require("GEMINI_API_KEY")
-GMAIL_USER      = _require("GMAIL_USER")
-GMAIL_APP_PASS  = _require("GMAIL_APP_PASS")
-FIREBASE_BUCKET = os.environ.get("FIREBASE_BUCKET", "aero-fit.firebasestorage.app")
-SCAN_LIMIT      = int(os.environ.get("SCAN_LIMIT", "10"))
+GEMINI_API_KEY      = _require("GEMINI_API_KEY")
+GMAIL_USER          = _require("GMAIL_USER")
+GMAIL_APP_PASS      = _require("GMAIL_APP_PASS")
+MONGO_URI           = _require("MONGO_URI")           # e.g. mongodb+srv://user:pass@cluster.mongodb.net/aerofitdb
+CLOUDINARY_CLOUD    = _require("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY  = _require("CLOUDINARY_API_KEY")
+CLOUDINARY_SECRET   = _require("CLOUDINARY_API_SECRET")
+SCAN_LIMIT          = int(os.environ.get("SCAN_LIMIT", "10"))
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FIREBASE INIT
+#  MONGODB INIT
 # ══════════════════════════════════════════════════════════════════════════════
 
-import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from pymongo import MongoClient, DESCENDING
+from pymongo.collection import Collection
 
-_KEY_FILE = os.path.expanduser(
-    "~/Downloads/aero-fit-firebase-adminsdk-fbsvc-cdd5ade0cb.json"
+_mongo_client: MongoClient = MongoClient(MONGO_URI)
+
+# Parse DB name from URI or fall back to "aerofitdb"
+_db_name = MONGO_URI.rsplit("/", 1)[-1].split("?")[0].strip() or "aerofitdb"
+mdb = _mongo_client[_db_name]
+
+# Collections
+col_users:       Collection = mdb["users"]
+col_otps:        Collection = mdb["otps"]
+col_meals:       Collection = mdb["meals"]
+col_banners:     Collection = mdb["banners"]
+col_notifs:      Collection = mdb["notifications"]
+col_scan_limits: Collection = mdb["scan_limits"]
+
+# Indexes (safe to call on every startup)
+col_users.create_index("email",       unique=True)
+col_otps.create_index("email",        unique=True)
+col_otps.create_index("expires_at",   expireAfterSeconds=0)   # TTL index
+col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
+col_banners.create_index("created_at")
+col_notifs.create_index("sent_at")
+col_scan_limits.create_index([("email", 1), ("date", 1)], unique=True)
+
+print(f"✅  MongoDB connected → {_db_name}", flush=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLOUDINARY INIT
+# ══════════════════════════════════════════════════════════════════════════════
+
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name = CLOUDINARY_CLOUD,
+    api_key    = CLOUDINARY_API_KEY,
+    api_secret = CLOUDINARY_SECRET,
+    secure     = True,
 )
-
-if os.path.exists(_KEY_FILE):
-    cred = credentials.Certificate(_KEY_FILE)
-    print("🔑  Local Firebase JSON key loaded", flush=True)
-else:
-    private_key = _require("FIREBASE_PRIVATE_KEY")
-    if "\\n" in private_key and "\n" not in private_key:
-        private_key = private_key.replace("\\n", "\n")
-
-    FIREBASE_CREDS = {
-        "type":                        "service_account",
-        "project_id":                  _require("FIREBASE_PROJECT_ID"),
-        "private_key_id":              _require("FIREBASE_PRIVATE_KEY_ID"),
-        "private_key":                 private_key,
-        "client_email":                _require("FIREBASE_CLIENT_EMAIL"),
-        "client_id":                   _require("FIREBASE_CLIENT_ID"),
-        "auth_uri":                    "https://accounts.google.com/o/oauth2/auth",
-        "token_uri":                   "https://oauth2.googleapis.com/token",
-        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_x509_cert_url":        _require("FIREBASE_CLIENT_CERT_URL"),
-        "universe_domain":             "googleapis.com",
-    }
-    cred = credentials.Certificate(FIREBASE_CREDS)
-    print("🔑  Render env var Firebase credentials loaded", flush=True)
-
-firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_BUCKET})
-db     = firestore.client()
-bucket = storage.bucket()
-print("✅  Firebase connected", flush=True)
+print("✅  Cloudinary configured", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GEMINI INIT
@@ -79,19 +89,16 @@ print("✅  Firebase connected", flush=True)
 from google import genai
 from google.genai import types
 
-client     = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MDL = "gemini-2.5-flash"
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MDL    = "gemini-2.5-flash"
 print(f"✅  Gemini ready → {GEMINI_MDL}", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="7.2.0")
+app = FastAPI(title="AERO-FIT API", version="8.0.0")
 
-# ── CORS ── must be the very first middleware ──────────────────────────────────
-# List every origin that will call this API.
-# Add your production frontend URL here when you deploy it.
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:5174",
@@ -104,17 +111,14 @@ ALLOWED_ORIGINS = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
+    allow_origins     = ALLOWED_ORIGINS,
+    allow_credentials = False,
+    allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers     = ["*"],
+    expose_headers    = ["*"],
+    max_age           = 3600,
 )
 
-# ── Catch-all OPTIONS handler ──────────────────────────────────────────────────
-# Guarantees preflight requests always get a 200 with CORS headers,
-# even for routes that don't explicitly define an OPTIONS method.
 @app.options("/{rest_of_path:path}")
 async def preflight_handler(request: Request, rest_of_path: str):
     return JSONResponse(
@@ -128,21 +132,23 @@ async def preflight_handler(request: Request, rest_of_path: str):
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
+#  HELPERS — GENERAL
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _strip_b64_prefix(b64: str) -> str:
+    """Remove data-URI prefix if present."""
+    return b64.split(",", 1)[1].strip() if "," in b64 else b64.strip()
+
 
 def _b64_to_part(b64: str, mime: str = "image/jpeg") -> types.Part:
     if not b64:
         raise ValueError("Empty image data")
-    if "," in b64:
-        b64 = b64.split(",", 1)[1]
-    b64 = b64.strip()
-    return types.Part.from_bytes(data=base64.b64decode(b64), mime_type=mime)
+    return types.Part.from_bytes(data=base64.b64decode(_strip_b64_prefix(b64)), mime_type=mime)
 
 
 def _ask_gemini(parts: list, prompt: str) -> str:
     all_parts = list(parts) + [types.Part.from_text(text=prompt)]
-    response  = client.models.generate_content(
+    response  = gemini_client.models.generate_content(
         model    = GEMINI_MDL,
         contents = [types.Content(role="user", parts=all_parts)],
     )
@@ -164,47 +170,65 @@ def _safe_int(val, default: int = 0) -> int:
         return default
 
 
+def _doc(d: dict) -> dict:
+    """Strip MongoDB _id before returning to client."""
+    d.pop("_id", None)
+    return d
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS — CLOUDINARY IMAGE UPLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upload_image(base64_str: str, folder: str, public_id: str = None) -> str:
+    """
+    Upload a base64 image to Cloudinary.
+    Returns the secure HTTPS URL, or "" if base64_str is empty.
+    """
+    if not base64_str:
+        return ""
+
+    raw       = _strip_b64_prefix(base64_str)
+    data_uri  = f"data:image/jpeg;base64,{raw}"          # Cloudinary accepts data URIs
+    public_id = public_id or str(uuid.uuid4())
+
+    result = cloudinary.uploader.upload(
+        data_uri,
+        folder            = folder,
+        public_id         = public_id,
+        overwrite         = True,
+        resource_type     = "image",
+        format            = "jpg",
+        transformation    = [{"quality": "auto", "fetch_format": "auto"}],
+    )
+    url = result.get("secure_url", "")
+    print(f"✅  Cloudinary upload → {url}", flush=True)
+    return url
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS — SCAN LIMIT
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _check_and_increment_scan_limit(email: str) -> int:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    ref   = db.collection("scan_limits").document(f"{email}_{today}")
-    doc   = ref.get()
-    if doc.exists:
-        count = doc.to_dict().get("count", 0)
+    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    filter = {"email": email, "date": today}
+    doc    = col_scan_limits.find_one(filter)
+
+    if doc:
+        count = doc.get("count", 0)
         if count >= SCAN_LIMIT:
             raise HTTPException(
                 429,
-                f"Daily scan limit reached ({SCAN_LIMIT}/day). Try again tomorrow! 🔄"
+                f"Daily scan limit reached ({SCAN_LIMIT}/day). Try again tomorrow! 🔄",
             )
-        ref.update({"count": count + 1})
+        col_scan_limits.update_one(filter, {"$inc": {"count": 1}})
         return SCAN_LIMIT - (count + 1)
     else:
-        ref.set({"email": email, "date": today, "count": 1})
+        col_scan_limits.insert_one({**filter, "count": 1})
         return SCAN_LIMIT - 1
 
-
-def upload_image(base64_str: str, folder: str, filename: str = None) -> str:
-    if not base64_str:
-        return ""
-    if "," in base64_str:
-        base64_str = base64_str.split(",", 1)[1]
-    base64_str  = base64_str.strip()
-    image_bytes = base64.b64decode(base64_str)
-    filename    = filename or f"{uuid.uuid4()}.jpg"
-    blob_path   = f"{folder}/{filename}"
-    blob        = bucket.blob(blob_path)
-
-    download_token = str(uuid.uuid4())
-    blob.metadata  = {"firebaseStorageDownloadTokens": download_token}
-    blob.upload_from_string(image_bytes, content_type="image/jpeg")
-
-    encoded_path = blob_path.replace("/", "%2F")
-    url = (
-        f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}"
-        f"/o/{encoded_path}?alt=media&token={download_token}"
-    )
-    print(f"✅  Uploaded → {url}", flush=True)
-    return url
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS — EMAIL / OTP
+# ══════════════════════════════════════════════════════════════════════════════
 
 def send_otp_email(to_email: str, otp: str) -> bool:
     try:
@@ -221,7 +245,6 @@ def send_otp_email(to_email: str, otp: str) -> bool:
     except Exception as e:
         print(f"❌  Email failed: {e}  —  OTP: {otp}", flush=True)
         return False
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PYDANTIC MODELS
@@ -276,15 +299,13 @@ class NotificationCreate(BaseModel):
     deep_link:    Optional[str] = None
     scheduled_at: Optional[str] = None
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "7.2.0", "db": "firebase", "ai": GEMINI_MDL}
-
+    return {"status": "ok", "version": "8.0.0", "db": "mongodb", "ai": GEMINI_MDL}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — BANNERS
@@ -293,14 +314,10 @@ def health():
 @app.post("/banners")
 def create_banner(req: BannerCreate):
     banner_id = str(uuid.uuid4())
-    image_url = ""
-    if req.image_base64:
-        image_url = upload_image(
-            req.image_base64,
-            folder   = "banners",
-            filename = f"{banner_id}.jpg",
-        )
-    db.collection("banners").document(banner_id).set({
+    image_url = upload_image(req.image_base64 or "", folder="aerofitdb/banners", public_id=banner_id)
+
+    doc = {
+        "banner_id":  banner_id,
         "title":      req.title,
         "screen":     req.screen,
         "status":     req.status,
@@ -308,33 +325,24 @@ def create_banner(req: BannerCreate):
         "deep_link":  req.deep_link  or "",
         "image_url":  image_url,
         "created_at": datetime.now(timezone.utc),
-    })
+    }
+    col_banners.insert_one(doc)
     return {"status": "created", "banner_id": banner_id, "image_url": image_url}
 
 
 @app.get("/banners")
 def list_banners(screen: str = None):
-    docs    = db.collection("banners").stream()
-    banners = [{"id": d.id, **d.to_dict()} for d in docs]
-
-    if screen:
-        banners = [b for b in banners if b.get("screen") == screen]
-
-    def sort_key(b):
-        ca = b.get("created_at")
-        if ca is None: return 0
-        if hasattr(ca, "timestamp"): return ca.timestamp()
-        return 0
-
-    banners.sort(key=sort_key, reverse=True)
-    return banners
+    query = {"screen": screen} if screen else {}
+    docs  = list(col_banners.find(query).sort("created_at", DESCENDING))
+    return [_doc(d) for d in docs]
 
 
 @app.delete("/banners/{banner_id}")
 def delete_banner(banner_id: str):
-    db.collection("banners").document(banner_id).delete()
+    result = col_banners.delete_one({"banner_id": banner_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Banner not found")
     return {"status": "deleted"}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — NOTIFICATIONS
@@ -343,25 +351,24 @@ def delete_banner(banner_id: str):
 @app.post("/notifications")
 def create_notification(req: NotificationCreate):
     notif_id = str(uuid.uuid4())
-    db.collection("notifications").document(notif_id).set({
-        "title":        req.title,
-        "body":         req.body,
-        "type":         req.type,
-        "segments":     req.segments,
-        "deep_link":    req.deep_link    or "",
-        "scheduled_at": req.scheduled_at or "",
-        "sent_at":      datetime.now(timezone.utc),
-    })
+    doc = {
+        "notification_id": notif_id,
+        "title":           req.title,
+        "body":            req.body,
+        "type":            req.type,
+        "segments":        req.segments,
+        "deep_link":       req.deep_link    or "",
+        "scheduled_at":    req.scheduled_at or "",
+        "sent_at":         datetime.now(timezone.utc),
+    }
+    col_notifs.insert_one(doc)
     return {"status": "sent", "notification_id": notif_id}
 
 
 @app.get("/notifications")
 def list_notifications():
-    docs = db.collection("notifications").order_by(
-        "sent_at", direction=firestore.Query.DESCENDING
-    ).limit(50).stream()
-    return [{"id": d.id, **d.to_dict()} for d in docs]
-
+    docs = list(col_notifs.find().sort("sent_at", DESCENDING).limit(50))
+    return [_doc(d) for d in docs]
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — SCAN LIMIT
@@ -370,15 +377,14 @@ def list_notifications():
 @app.get("/scan-limit/{email}")
 def get_scan_limit(email: str):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    doc   = db.collection("scan_limits").document(f"{email.lower()}_{today}").get()
-    used  = doc.to_dict().get("count", 0) if doc.exists else 0
+    doc   = col_scan_limits.find_one({"email": email.lower(), "date": today})
+    used  = doc.get("count", 0) if doc else 0
     return {
         "email":     email.lower(),
         "used":      used,
         "limit":     SCAN_LIMIT,
         "remaining": max(0, SCAN_LIMIT - used),
     }
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — OTP
@@ -392,13 +398,19 @@ def send_otp(req: OtpRequest):
 
     otp      = str(random.randint(100000, 999999))
     otp_hash = bcrypt.hashpw(otp.encode(), bcrypt.gensalt()).decode()
+    expires  = datetime.now(timezone.utc) + timedelta(minutes=10)
 
-    db.collection("otps").document(email).set({
-        "otp_hash":   otp_hash,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
-        "used":       False,
-        "attempts":   0,
-    })
+    col_otps.replace_one(
+        {"email": email},
+        {
+            "email":      email,
+            "otp_hash":   otp_hash,
+            "expires_at": expires,           # TTL index will auto-delete expired docs
+            "used":       False,
+            "attempts":   0,
+        },
+        upsert=True,
+    )
 
     return {
         "status":     "sent",
@@ -410,52 +422,47 @@ def send_otp(req: OtpRequest):
 
 @app.post("/verify-otp")
 def verify_otp(req: OtpVerifyRequest):
-    email = req.email.strip().lower()
-    doc   = db.collection("otps").document(email).get()
+    email  = req.email.strip().lower()
+    record = col_otps.find_one({"email": email})
 
-    if not doc.exists:
+    if not record:
         raise HTTPException(400, "No active OTP")
-
-    record = doc.to_dict()
-
     if record.get("used"):
         raise HTTPException(400, "OTP already used")
 
     expires_at = record["expires_at"]
-    if hasattr(expires_at, "replace"):
+    if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
     if datetime.now(timezone.utc) > expires_at:
-        db.collection("otps").document(email).delete()
+        col_otps.delete_one({"email": email})
         raise HTTPException(400, "Code expired")
 
     attempts = record.get("attempts", 0)
     if attempts >= 5:
-        db.collection("otps").document(email).delete()
+        col_otps.delete_one({"email": email})
         raise HTTPException(400, "Too many attempts")
 
     if not bcrypt.checkpw(req.otp.strip().encode(), record["otp_hash"].encode()):
-        db.collection("otps").document(email).update({"attempts": attempts + 1})
+        col_otps.update_one({"email": email}, {"$inc": {"attempts": 1}})
         raise HTTPException(400, f"Incorrect code. {4 - attempts} left.")
 
-    db.collection("otps").document(email).update({"used": True})
+    col_otps.update_one({"email": email}, {"$set": {"used": True}})
 
-    user_doc = db.collection("users").document(email).get()
-    if user_doc.exists:
-        u = user_doc.to_dict()
+    user = col_users.find_one({"email": email})
+    if user:
         return {
             "status": "verified",
             "is_new": False,
             "user": {
-                "email":     u["email"],
-                "name":      u["name"],
-                "weight_kg": u["weight_kg"],
-                "height_cm": u["height_cm"],
+                "email":     user["email"],
+                "name":      user["name"],
+                "weight_kg": user["weight_kg"],
+                "height_cm": user["height_cm"],
             },
         }
 
     return {"status": "verified", "is_new": True, "user": None}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — USER PROFILE
@@ -464,37 +471,37 @@ def verify_otp(req: OtpVerifyRequest):
 @app.post("/save-profile")
 def save_profile(req: UserProfile):
     email = req.email.strip().lower()
-    db.collection("users").document(email).set(
-        {
+    col_users.update_one(
+        {"email": email},
+        {"$set": {
             "email":      email,
             "name":       req.name.strip(),
             "weight_kg":  req.weight_kg,
             "height_cm":  req.height_cm,
             "updated_at": datetime.now(timezone.utc),
-        },
-        merge=True,
+        }},
+        upsert=True,
     )
     return {"status": "saved", "email": email}
 
 
 @app.get("/user/{email}")
 def get_user(email: str):
-    doc = db.collection("users").document(email.lower()).get()
-    if not doc.exists:
+    user = col_users.find_one({"email": email.lower()})
+    if not user:
         raise HTTPException(404, "User not found")
-    u = doc.to_dict()
     return {
-        "email":     u["email"],
-        "name":      u["name"],
-        "weight_kg": u["weight_kg"],
-        "height_cm": u["height_cm"],
+        "email":     user["email"],
+        "name":      user["name"],
+        "weight_kg": user["weight_kg"],
+        "height_cm": user["height_cm"],
     }
 
 
 @app.put("/user/{email}")
 def update_user(email: str, req: UserUpdate):
-    ref = db.collection("users").document(email.lower())
-    if not ref.get().exists:
+    email = email.lower()
+    if not col_users.find_one({"email": email}):
         raise HTTPException(404, "User not found")
 
     update: dict = {"updated_at": datetime.now(timezone.utc)}
@@ -502,9 +509,8 @@ def update_user(email: str, req: UserUpdate):
     if req.weight_kg is not None: update["weight_kg"] = req.weight_kg
     if req.height_cm is not None: update["height_cm"] = req.height_cm
 
-    ref.update(update)
+    col_users.update_one({"email": email}, {"$set": update})
     return {"status": "updated"}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — MEALS
@@ -548,10 +554,11 @@ def log_meal(req: LogMealRequest):
         meal_id   = str(uuid.uuid4())
         image_url = upload_image(
             req.image_base64 or "",
-            folder   = f"meals/{req.email.lower()}",
-            filename = f"{meal_id}.jpg",
+            folder    = f"aerofitdb/meals/{req.email.lower()}",
+            public_id = meal_id,
         )
-        db.collection("meals").document(meal_id).set({
+        doc = {
+            "meal_id":      meal_id,
             "email":        req.email.lower(),
             "name":         req.name,
             "kcal":         req.kcal,
@@ -562,7 +569,8 @@ def log_meal(req: LogMealRequest):
             "serving_size": req.serving_size,
             "image_url":    image_url,
             "logged_at":    datetime.now(timezone.utc),
-        })
+        }
+        col_meals.insert_one(doc)
         print(f"✅  Meal logged → {meal_id}", flush=True)
         return {"status": "logged", "meal_id": meal_id, "image_url": image_url}
     except HTTPException:
@@ -575,30 +583,19 @@ def log_meal(req: LogMealRequest):
 @app.get("/meals/{email}")
 def get_meals(email: str, days: int = 1):
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    docs  = (
-        db.collection("meals")
-          .where("email",     "==", email.lower())
-          .where("logged_at", ">=", since)
-          .stream()
+    docs  = list(
+        col_meals.find(
+            {"email": email.lower(), "logged_at": {"$gte": since}}
+        ).sort("logged_at", DESCENDING)
     )
-    meals = [{"id": d.id, **d.to_dict()} for d in docs]
-
-    def sort_key(m):
-        la = m.get("logged_at")
-        if la is None: return 0
-        if hasattr(la, "timestamp"): return la.timestamp()
-        return 0
-
-    meals.sort(key=sort_key, reverse=True)
-    return meals
+    return [_doc(d) for d in docs]
 
 
 @app.delete("/meal/{meal_id}")
 def delete_meal(meal_id: str):
-    ref = db.collection("meals").document(meal_id)
-    if not ref.get().exists:
+    result = col_meals.delete_one({"meal_id": meal_id})
+    if result.deleted_count == 0:
         raise HTTPException(404, "Meal not found")
-    ref.delete()
     return {"status": "deleted"}
 
 

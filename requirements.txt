@@ -1,6 +1,7 @@
 fastapi==0.115.5
 uvicorn==0.32.1
-firebase-admin==6.6.0
+pymongo[srv]==4.7.3
+cloudinary==1.41.0
 google-genai==1.16.0
 bcrypt==4.2.1
 python-dotenv==1.0.1
