@@ -1,4 +1,4 @@
-import os, json, re, random, smtplib, bcrypt, uuid, base64, traceback
+import os, sys, json, re, random, smtplib, bcrypt, uuid, base64, traceback
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -7,79 +7,103 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from dotenv import load_dotenv
-load_dotenv()
-
-import firebase_admin
-from firebase_admin import credentials, firestore, storage
-
-from google import genai
-from google.genai import types
+# ── Load .env for local dev (no-op on Render) ─────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIG
+#  CONFIG  — validate all required env vars at startup so Render logs show
+#            exactly which variable is missing instead of a cryptic traceback
 # ══════════════════════════════════════════════════════════════════════════════
 
-GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
-GMAIL_USER      = os.environ["GMAIL_USER"]
-GMAIL_APP_PASS  = os.environ["GMAIL_APP_PASS"]
+def _require(key: str) -> str:
+    val = os.environ.get(key, "").strip()
+    if not val:
+        print(f"❌  FATAL: environment variable '{key}' is missing or empty", flush=True)
+        sys.exit(1)
+    return val
+
+GEMINI_API_KEY  = _require("GEMINI_API_KEY")
+GMAIL_USER      = _require("GMAIL_USER")
+GMAIL_APP_PASS  = _require("GMAIL_APP_PASS")
 FIREBASE_BUCKET = os.environ.get("FIREBASE_BUCKET", "aero-fit.firebasestorage.app")
 SCAN_LIMIT      = int(os.environ.get("SCAN_LIMIT", "10"))
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FIREBASE INIT — JSON file locally, env vars on Render
+#  FIREBASE INIT
+#  Local  → reads JSON key file from ~/Downloads/
+#  Render → reads individual env vars (set each field separately)
 # ══════════════════════════════════════════════════════════════════════════════
+
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
 
 _KEY_FILE = os.path.expanduser(
     "~/Downloads/aero-fit-firebase-adminsdk-fbsvc-cdd5ade0cb.json"
 )
 
 if os.path.exists(_KEY_FILE):
-    # LOCAL: use the downloaded JSON file directly
+    # ── LOCAL dev ─────────────────────────────────────────────────────────────
     cred = credentials.Certificate(_KEY_FILE)
-    print("🔑  Using local Firebase JSON key")
+    print("🔑  Local Firebase JSON key loaded", flush=True)
 else:
-    # PRODUCTION (Render): build creds from env vars
-    private_key = os.environ["FIREBASE_PRIVATE_KEY"]
-    if "\\n" in private_key:
+    # ── PRODUCTION (Render) ───────────────────────────────────────────────────
+    # Paste the full private key into the Render env var.
+    # Render preserves literal newlines — do NOT escape as \n.
+    # If you accidentally pasted \n escapes, this block fixes them:
+    private_key = _require("FIREBASE_PRIVATE_KEY")
+    if "\\n" in private_key and "\n" not in private_key:
         private_key = private_key.replace("\\n", "\n")
 
     FIREBASE_CREDS = {
         "type":                        "service_account",
-        "project_id":                  os.environ["FIREBASE_PROJECT_ID"],
-        "private_key_id":              os.environ["FIREBASE_PRIVATE_KEY_ID"],
+        "project_id":                  _require("FIREBASE_PROJECT_ID"),
+        "private_key_id":              _require("FIREBASE_PRIVATE_KEY_ID"),
         "private_key":                 private_key,
-        "client_email":                os.environ["FIREBASE_CLIENT_EMAIL"],
-        "client_id":                   os.environ["FIREBASE_CLIENT_ID"],
+        "client_email":                _require("FIREBASE_CLIENT_EMAIL"),
+        "client_id":                   _require("FIREBASE_CLIENT_ID"),
         "auth_uri":                    "https://accounts.google.com/o/oauth2/auth",
         "token_uri":                   "https://oauth2.googleapis.com/token",
         "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_x509_cert_url":        os.environ["FIREBASE_CLIENT_CERT_URL"],
+        "client_x509_cert_url":        _require("FIREBASE_CLIENT_CERT_URL"),
         "universe_domain":             "googleapis.com",
     }
     cred = credentials.Certificate(FIREBASE_CREDS)
-    print("🔑  Using Render env var Firebase credentials")
+    print("🔑  Render env var Firebase credentials loaded", flush=True)
 
 firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_BUCKET})
 db     = firestore.client()
 bucket = storage.bucket()
-print("✅  Firebase connected")
+print("✅  Firebase connected", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GEMINI INIT
 # ══════════════════════════════════════════════════════════════════════════════
 
+from google import genai
+from google.genai import types
+
 client     = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MDL = "gemini-2.5-flash"
-print(f"✅  Gemini ready → {GEMINI_MDL}")
+print(f"✅  Gemini ready → {GEMINI_MDL}", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FASTAPI
+#  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="7.0.0")
+app = FastAPI(title="AERO-FIT API", version="7.1.0")
+
+# Allow all origins — CORS must be the FIRST middleware added
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,        # must be False when allow_origins=["*"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -157,7 +181,7 @@ def upload_image(base64_str: str, folder: str, filename: str = None) -> str:
         f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_BUCKET}"
         f"/o/{encoded_path}?alt=media&token={download_token}"
     )
-    print(f"✅  Uploaded → {url}")
+    print(f"✅  Uploaded → {url}", flush=True)
     return url
 
 
@@ -171,10 +195,10 @@ def send_otp_email(to_email: str, otp: str) -> bool:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(GMAIL_USER, GMAIL_APP_PASS)
             s.sendmail(GMAIL_USER, to_email, msg.as_string())
-        print(f"✅  OTP sent to {to_email}")
+        print(f"✅  OTP sent to {to_email}", flush=True)
         return True
     except Exception as e:
-        print(f"❌  Email failed: {e}  —  OTP: {otp}")
+        print(f"❌  Email failed: {e}  —  OTP: {otp}", flush=True)
         return False
 
 
@@ -217,8 +241,8 @@ class LogMealRequest(BaseModel):
 
 class BannerCreate(BaseModel):
     title:        str
-    screen:       str = "home"
-    status:       str = "active"
+    screen:       str          = "home"
+    status:       str          = "active"
     expires_at:   Optional[str] = None
     deep_link:    Optional[str] = None
     image_base64: Optional[str] = None
@@ -226,19 +250,19 @@ class BannerCreate(BaseModel):
 class NotificationCreate(BaseModel):
     title:        str
     body:         str
-    type:         str = "general"
-    segments:     list[str] = ["all"]
+    type:         str          = "general"
+    segments:     list[str]    = ["all"]
     deep_link:    Optional[str] = None
     scheduled_at: Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — HEALTH
+#  ROUTES — HEALTH  (used as Render health-check path)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "db": "firebase", "ai": GEMINI_MDL}
+    return {"status": "ok", "version": "7.1.0", "db": "firebase", "ai": GEMINI_MDL}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -259,8 +283,8 @@ def create_banner(req: BannerCreate):
         "title":      req.title,
         "screen":     req.screen,
         "status":     req.status,
-        "expires_at": req.expires_at,
-        "deep_link":  req.deep_link,
+        "expires_at": req.expires_at or "",
+        "deep_link":  req.deep_link  or "",
         "image_url":  image_url,
         "created_at": datetime.now(timezone.utc),
     })
@@ -294,8 +318,8 @@ def create_notification(req: NotificationCreate):
         "body":         req.body,
         "type":         req.type,
         "segments":     req.segments,
-        "deep_link":    req.deep_link,
-        "scheduled_at": req.scheduled_at,
+        "deep_link":    req.deep_link    or "",
+        "scheduled_at": req.scheduled_at or "",
         "sent_at":      datetime.now(timezone.utc),
     })
     return {"status": "sent", "notification_id": notif_id}
@@ -478,7 +502,7 @@ def analyze_meal(req: MealRequest):
             "carbs":           _safe_int(d.get("carbs")),
             "fat":             _safe_int(d.get("fat")),
             "fiber":           _safe_int(d.get("fiber")),
-            "notes":           str(d.get("notes",   "")),
+            "notes":           str(d.get("notes", "")),
             "scans_remaining": remaining,
         }
     except HTTPException:
@@ -492,9 +516,8 @@ def analyze_meal(req: MealRequest):
 def log_meal(req: LogMealRequest):
     try:
         meal_id   = str(uuid.uuid4())
-        print(f"📦  Uploading meal image for {req.email}")
         image_url = upload_image(
-            req.image_base64,
+            req.image_base64 or "",
             folder   = f"meals/{req.email.lower()}",
             filename = f"{meal_id}.jpg",
         )
@@ -510,7 +533,7 @@ def log_meal(req: LogMealRequest):
             "image_url":    image_url,
             "logged_at":    datetime.now(timezone.utc),
         })
-        print(f"✅  Meal logged → {meal_id}")
+        print(f"✅  Meal logged → {meal_id}", flush=True)
         return {"status": "logged", "meal_id": meal_id, "image_url": image_url}
     except HTTPException:
         raise
