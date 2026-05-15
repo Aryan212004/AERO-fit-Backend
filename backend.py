@@ -3,8 +3,9 @@ from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # ── Load .env for local dev (no-op on Render) ─────────────────────────────────
@@ -15,8 +16,7 @@ except ImportError:
     pass
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIG  — validate all required env vars at startup so Render logs show
-#            exactly which variable is missing instead of a cryptic traceback
+#  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _require(key: str) -> str:
@@ -34,8 +34,6 @@ SCAN_LIMIT      = int(os.environ.get("SCAN_LIMIT", "10"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FIREBASE INIT
-#  Local  → reads JSON key file from ~/Downloads/
-#  Render → reads individual env vars (set each field separately)
 # ══════════════════════════════════════════════════════════════════════════════
 
 import firebase_admin
@@ -46,14 +44,9 @@ _KEY_FILE = os.path.expanduser(
 )
 
 if os.path.exists(_KEY_FILE):
-    # ── LOCAL dev ─────────────────────────────────────────────────────────────
     cred = credentials.Certificate(_KEY_FILE)
     print("🔑  Local Firebase JSON key loaded", flush=True)
 else:
-    # ── PRODUCTION (Render) ───────────────────────────────────────────────────
-    # Paste the full private key into the Render env var.
-    # Render preserves literal newlines — do NOT escape as \n.
-    # If you accidentally pasted \n escapes, this block fixes them:
     private_key = _require("FIREBASE_PRIVATE_KEY")
     if "\\n" in private_key and "\n" not in private_key:
         private_key = private_key.replace("\\n", "\n")
@@ -94,17 +87,45 @@ print(f"✅  Gemini ready → {GEMINI_MDL}", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="7.1.0")
+app = FastAPI(title="AERO-FIT API", version="7.2.0")
 
-# Allow all origins — CORS must be the FIRST middleware added
+# ── CORS ── must be the very first middleware ──────────────────────────────────
+# List every origin that will call this API.
+# Add your production frontend URL here when you deploy it.
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:3000",
+    # "https://your-deployed-frontend.com",   # ← uncomment & fill in for prod
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,        # must be False when allow_origins=["*"]
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
+    max_age=3600,
 )
+
+# ── Catch-all OPTIONS handler ──────────────────────────────────────────────────
+# Guarantees preflight requests always get a 200 with CORS headers,
+# even for routes that don't explicitly define an OPTIONS method.
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(request: Request, rest_of_path: str):
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin":  request.headers.get("origin", "*"),
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age":       "3600",
+        },
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -241,8 +262,8 @@ class LogMealRequest(BaseModel):
 
 class BannerCreate(BaseModel):
     title:        str
-    screen:       str          = "home"
-    status:       str          = "active"
+    screen:       str           = "home"
+    status:       str           = "active"
     expires_at:   Optional[str] = None
     deep_link:    Optional[str] = None
     image_base64: Optional[str] = None
@@ -250,19 +271,19 @@ class BannerCreate(BaseModel):
 class NotificationCreate(BaseModel):
     title:        str
     body:         str
-    type:         str          = "general"
-    segments:     list[str]    = ["all"]
+    type:         str        = "general"
+    segments:     list[str]  = ["all"]
     deep_link:    Optional[str] = None
     scheduled_at: Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — HEALTH  (used as Render health-check path)
+#  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "7.1.0", "db": "firebase", "ai": GEMINI_MDL}
+    return {"status": "ok", "version": "7.2.0", "db": "firebase", "ai": GEMINI_MDL}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,22 +314,18 @@ def create_banner(req: BannerCreate):
 
 @app.get("/banners")
 def list_banners(screen: str = None):
-    docs = db.collection("banners").stream()
+    docs    = db.collection("banners").stream()
     banners = [{"id": d.id, **d.to_dict()} for d in docs]
-    
-    # Filter and sort in Python instead of Firestore query
+
     if screen:
         banners = [b for b in banners if b.get("screen") == screen]
-    
-    # Sort by created_at descending in Python
+
     def sort_key(b):
         ca = b.get("created_at")
-        if ca is None:
-            return 0
-        if hasattr(ca, "timestamp"):   # Firestore Timestamp
-            return ca.timestamp()
+        if ca is None: return 0
+        if hasattr(ca, "timestamp"): return ca.timestamp()
         return 0
-    
+
     banners.sort(key=sort_key, reverse=True)
     return banners
 
@@ -565,14 +582,13 @@ def get_meals(email: str, days: int = 1):
           .stream()
     )
     meals = [{"id": d.id, **d.to_dict()} for d in docs]
-    
-    # Sort in Python instead
+
     def sort_key(m):
         la = m.get("logged_at")
         if la is None: return 0
         if hasattr(la, "timestamp"): return la.timestamp()
         return 0
-    
+
     meals.sort(key=sort_key, reverse=True)
     return meals
 
