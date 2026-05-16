@@ -1,7 +1,5 @@
-import os, sys, json, re, random, smtplib, bcrypt, uuid, base64, traceback
+import os, sys, json, re, bcrypt, uuid, base64, traceback
 from datetime import datetime, timezone, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,14 +24,16 @@ def _require(key: str) -> str:
         sys.exit(1)
     return val
 
-GEMINI_API_KEY      = _require("GEMINI_API_KEY")
-GMAIL_USER          = _require("GMAIL_USER")
-GMAIL_APP_PASS      = _require("GMAIL_APP_PASS")
-MONGO_URI           = _require("MONGO_URI")           # e.g. mongodb+srv://user:pass@cluster.mongodb.net/aerofitdb
-CLOUDINARY_CLOUD    = _require("CLOUDINARY_CLOUD_NAME")
-CLOUDINARY_API_KEY  = _require("CLOUDINARY_API_KEY")
-CLOUDINARY_SECRET   = _require("CLOUDINARY_API_SECRET")
-SCAN_LIMIT          = int(os.environ.get("SCAN_LIMIT", "10"))
+GEMINI_API_KEY     = _require("GEMINI_API_KEY")
+MONGO_URI          = _require("MONGO_URI")
+CLOUDINARY_CLOUD   = _require("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = _require("CLOUDINARY_API_KEY")
+CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
+SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
+
+# Admin credentials — set these in Render environment variables
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "aerofit2025"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONGODB INIT
@@ -44,22 +44,18 @@ from pymongo.collection import Collection
 
 _mongo_client: MongoClient = MongoClient(MONGO_URI)
 
-# Parse DB name from URI or fall back to "aerofitdb"
 _db_name = MONGO_URI.rsplit("/", 1)[-1].split("?")[0].strip() or "aerofitdb"
 mdb = _mongo_client[_db_name]
 
 # Collections
 col_users:       Collection = mdb["users"]
-col_otps:        Collection = mdb["otps"]
 col_meals:       Collection = mdb["meals"]
 col_banners:     Collection = mdb["banners"]
 col_notifs:      Collection = mdb["notifications"]
 col_scan_limits: Collection = mdb["scan_limits"]
 
-# Indexes (safe to call on every startup)
-col_users.create_index("email",       unique=True)
-col_otps.create_index("email",        unique=True)
-col_otps.create_index("expires_at",   expireAfterSeconds=0)   # TTL index
+# Indexes
+col_users.create_index("email", unique=True)
 col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
 col_banners.create_index("created_at")
 col_notifs.create_index("sent_at")
@@ -97,7 +93,7 @@ print(f"✅  Gemini ready → {GEMINI_MDL}", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="8.0.0")
+app = FastAPI(title="AERO-FIT API", version="9.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -106,7 +102,7 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
     "http://127.0.0.1:3000",
-    # "https://your-deployed-frontend.com",   # ← uncomment & fill in for prod
+    # "https://your-deployed-frontend.com",  # ← uncomment for prod
 ]
 
 app.add_middleware(
@@ -136,14 +132,14 @@ async def preflight_handler(request: Request, rest_of_path: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _strip_b64_prefix(b64: str) -> str:
-    """Remove data-URI prefix if present."""
     return b64.split(",", 1)[1].strip() if "," in b64 else b64.strip()
 
 
 def _b64_to_part(b64: str, mime: str = "image/jpeg") -> types.Part:
     if not b64:
         raise ValueError("Empty image data")
-    return types.Part.from_bytes(data=base64.b64decode(_strip_b64_prefix(b64)), mime_type=mime)
+    return types.Part.from_bytes(
+        data=base64.b64decode(_strip_b64_prefix(b64)), mime_type=mime)
 
 
 def _ask_gemini(parts: list, prompt: str) -> str:
@@ -180,25 +176,19 @@ def _doc(d: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def upload_image(base64_str: str, folder: str, public_id: str = None) -> str:
-    """
-    Upload a base64 image to Cloudinary.
-    Returns the secure HTTPS URL, or "" if base64_str is empty.
-    """
     if not base64_str:
         return ""
-
-    raw       = _strip_b64_prefix(base64_str)
-    data_uri  = f"data:image/jpeg;base64,{raw}"          # Cloudinary accepts data URIs
+    raw      = _strip_b64_prefix(base64_str)
+    data_uri = f"data:image/jpeg;base64,{raw}"
     public_id = public_id or str(uuid.uuid4())
-
     result = cloudinary.uploader.upload(
         data_uri,
-        folder            = folder,
-        public_id         = public_id,
-        overwrite         = True,
-        resource_type     = "image",
-        format            = "jpg",
-        transformation    = [{"quality": "auto", "fetch_format": "auto"}],
+        folder         = folder,
+        public_id      = public_id,
+        overwrite      = True,
+        resource_type  = "image",
+        format         = "jpg",
+        transformation = [{"quality": "auto", "fetch_format": "auto"}],
     )
     url = result.get("secure_url", "")
     print(f"✅  Cloudinary upload → {url}", flush=True)
@@ -212,7 +202,6 @@ def _check_and_increment_scan_limit(email: str) -> int:
     today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     filter = {"email": email, "date": today}
     doc    = col_scan_limits.find_one(filter)
-
     if doc:
         count = doc.get("count", 0)
         if count >= SCAN_LIMIT:
@@ -227,41 +216,23 @@ def _check_and_increment_scan_limit(email: str) -> int:
         return SCAN_LIMIT - 1
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HELPERS — EMAIL / OTP
-# ══════════════════════════════════════════════════════════════════════════════
-
-def send_otp_email(to_email: str, otp: str) -> bool:
-    try:
-        msg            = MIMEMultipart("alternative")
-        msg["Subject"] = f"🔐 {otp} is your AERO-FIT code"
-        msg["From"]    = f"AERO-FIT <{GMAIL_USER}>"
-        msg["To"]      = to_email
-        msg.attach(MIMEText(f"Your AERO-FIT code: {otp}", "plain"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL_USER, GMAIL_APP_PASS)
-            s.sendmail(GMAIL_USER, to_email, msg.as_string())
-        print(f"✅  OTP sent to {to_email}", flush=True)
-        return True
-    except Exception as e:
-        print(f"❌  Email failed: {e}  —  OTP: {otp}", flush=True)
-        return False
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  PYDANTIC MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class OtpRequest(BaseModel):
-    email: str
+class AdminLogin(BaseModel):
+    username: str
+    password: str
 
-class OtpVerifyRequest(BaseModel):
-    email: str
-    otp:   str
-
-class UserProfile(BaseModel):
-    email:     str
+class AddUserRequest(BaseModel):
     name:      str
+    email:     str
+    password:  str
     weight_kg: float
     height_cm: float
+
+class UserLogin(BaseModel):
+    email:    str
+    password: str
 
 class UserUpdate(BaseModel):
     name:      Optional[str]   = None
@@ -294,8 +265,8 @@ class BannerCreate(BaseModel):
 class NotificationCreate(BaseModel):
     title:        str
     body:         str
-    type:         str        = "general"
-    segments:     list[str]  = ["all"]
+    type:         str       = "general"
+    segments:     list[str] = ["all"]
     deep_link:    Optional[str] = None
     scheduled_at: Optional[str] = None
 
@@ -305,7 +276,111 @@ class NotificationCreate(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "8.0.0", "db": "mongodb", "ai": GEMINI_MDL}
+    return {"status": "ok", "version": "9.0.0", "db": "mongodb", "ai": GEMINI_MDL}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — ADMIN AUTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/login")
+def admin_login(req: AdminLogin):
+    if req.username != ADMIN_USERNAME or req.password != ADMIN_PASSWORD:
+        raise HTTPException(401, "Invalid admin credentials")
+    return {"status": "ok", "role": "admin"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — ADMIN USER MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/add-user")
+def add_user(req: AddUserRequest):
+    email = req.email.strip().lower()
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
+        raise HTTPException(400, "Invalid email address")
+    if col_users.find_one({"email": email}):
+        raise HTTPException(409, "User already exists")
+    hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+    col_users.insert_one({
+        "email":      email,
+        "name":       req.name.strip(),
+        "password":   hashed,
+        "weight_kg":  req.weight_kg,
+        "height_cm":  req.height_cm,
+        "created_at": datetime.now(timezone.utc),
+    })
+    return {"status": "created", "email": email}
+
+
+@app.get("/admin/users")
+def list_users():
+    docs = list(col_users.find().sort("created_at", DESCENDING))
+    return [
+        {
+            "email":      d["email"],
+            "name":       d["name"],
+            "weight_kg":  d["weight_kg"],
+            "height_cm":  d["height_cm"],
+            "created_at": d.get("created_at", "").isoformat()
+                          if isinstance(d.get("created_at"), datetime) else "",
+        }
+        for d in docs
+    ]
+
+
+@app.delete("/admin/users/{email}")
+def remove_user(email: str):
+    result = col_users.delete_one({"email": email.lower()})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "User not found")
+    return {"status": "deleted"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — USER AUTH (app login)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/user/login")
+def user_login(req: UserLogin):
+    email = req.email.strip().lower()
+    user  = col_users.find_one({"email": email})
+    if not user or not user.get("password"):
+        raise HTTPException(401, "Invalid email or password")
+    if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
+        raise HTTPException(401, "Invalid email or password")
+    return {
+        "status": "ok",
+        "user": {
+            "email":     user["email"],
+            "name":      user["name"],
+            "weight_kg": user["weight_kg"],
+            "height_cm": user["height_cm"],
+        },
+    }
+
+
+@app.get("/user/{email}")
+def get_user(email: str):
+    user = col_users.find_one({"email": email.lower()})
+    if not user:
+        raise HTTPException(404, "User not found")
+    return {
+        "email":     user["email"],
+        "name":      user["name"],
+        "weight_kg": user["weight_kg"],
+        "height_cm": user["height_cm"],
+    }
+
+
+@app.put("/user/{email}")
+def update_user(email: str, req: UserUpdate):
+    email = email.lower()
+    if not col_users.find_one({"email": email}):
+        raise HTTPException(404, "User not found")
+    update: dict = {"updated_at": datetime.now(timezone.utc)}
+    if req.name      is not None: update["name"]      = req.name
+    if req.weight_kg is not None: update["weight_kg"] = req.weight_kg
+    if req.height_cm is not None: update["height_cm"] = req.height_cm
+    col_users.update_one({"email": email}, {"$set": update})
+    return {"status": "updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — BANNERS
@@ -314,8 +389,8 @@ def health():
 @app.post("/banners")
 def create_banner(req: BannerCreate):
     banner_id = str(uuid.uuid4())
-    image_url = upload_image(req.image_base64 or "", folder="aerofitdb/banners", public_id=banner_id)
-
+    image_url = upload_image(
+        req.image_base64 or "", folder="aerofitdb/banners", public_id=banner_id)
     doc = {
         "banner_id":  banner_id,
         "title":      req.title,
@@ -344,13 +419,6 @@ def delete_banner(banner_id: str):
         raise HTTPException(404, "Banner not found")
     return {"status": "deleted"}
 
-@app.delete("/notifications/{notification_id}")
-def delete_notification(notification_id: str):
-    result = col_notifs.delete_one({"notification_id": notification_id})
-    if result.deleted_count == 0:
-        raise HTTPException(404, "Notification not found")
-    return {"status": "deleted"}
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -377,6 +445,14 @@ def list_notifications():
     docs = list(col_notifs.find().sort("sent_at", DESCENDING).limit(50))
     return [_doc(d) for d in docs]
 
+
+@app.delete("/notifications/{notification_id}")
+def delete_notification(notification_id: str):
+    result = col_notifs.delete_one({"notification_id": notification_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Notification not found")
+    return {"status": "deleted"}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — SCAN LIMIT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -394,132 +470,6 @@ def get_scan_limit(email: str):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — OTP
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.post("/send-otp")
-def send_otp(req: OtpRequest):
-    email = req.email.strip().lower()
-    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
-        raise HTTPException(400, "Invalid email")
-
-    otp      = str(random.randint(100000, 999999))
-    otp_hash = bcrypt.hashpw(otp.encode(), bcrypt.gensalt()).decode()
-    expires  = datetime.now(timezone.utc) + timedelta(minutes=10)
-
-    col_otps.replace_one(
-        {"email": email},
-        {
-            "email":      email,
-            "otp_hash":   otp_hash,
-            "expires_at": expires,           # TTL index will auto-delete expired docs
-            "used":       False,
-            "attempts":   0,
-        },
-        upsert=True,
-    )
-
-    return {
-        "status":     "sent",
-        "email":      email,
-        "email_sent": send_otp_email(email, otp),
-        "expires_in": 600,
-    }
-
-
-@app.post("/verify-otp")
-def verify_otp(req: OtpVerifyRequest):
-    email  = req.email.strip().lower()
-    record = col_otps.find_one({"email": email})
-
-    if not record:
-        raise HTTPException(400, "No active OTP")
-    if record.get("used"):
-        raise HTTPException(400, "OTP already used")
-
-    expires_at = record["expires_at"]
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-    if datetime.now(timezone.utc) > expires_at:
-        col_otps.delete_one({"email": email})
-        raise HTTPException(400, "Code expired")
-
-    attempts = record.get("attempts", 0)
-    if attempts >= 5:
-        col_otps.delete_one({"email": email})
-        raise HTTPException(400, "Too many attempts")
-
-    if not bcrypt.checkpw(req.otp.strip().encode(), record["otp_hash"].encode()):
-        col_otps.update_one({"email": email}, {"$inc": {"attempts": 1}})
-        raise HTTPException(400, f"Incorrect code. {4 - attempts} left.")
-
-    col_otps.update_one({"email": email}, {"$set": {"used": True}})
-
-    user = col_users.find_one({"email": email})
-    if user:
-        return {
-            "status": "verified",
-            "is_new": False,
-            "user": {
-                "email":     user["email"],
-                "name":      user["name"],
-                "weight_kg": user["weight_kg"],
-                "height_cm": user["height_cm"],
-            },
-        }
-
-    return {"status": "verified", "is_new": True, "user": None}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — USER PROFILE
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.post("/save-profile")
-def save_profile(req: UserProfile):
-    email = req.email.strip().lower()
-    col_users.update_one(
-        {"email": email},
-        {"$set": {
-            "email":      email,
-            "name":       req.name.strip(),
-            "weight_kg":  req.weight_kg,
-            "height_cm":  req.height_cm,
-            "updated_at": datetime.now(timezone.utc),
-        }},
-        upsert=True,
-    )
-    return {"status": "saved", "email": email}
-
-
-@app.get("/user/{email}")
-def get_user(email: str):
-    user = col_users.find_one({"email": email.lower()})
-    if not user:
-        raise HTTPException(404, "User not found")
-    return {
-        "email":     user["email"],
-        "name":      user["name"],
-        "weight_kg": user["weight_kg"],
-        "height_cm": user["height_cm"],
-    }
-
-
-@app.put("/user/{email}")
-def update_user(email: str, req: UserUpdate):
-    email = email.lower()
-    if not col_users.find_one({"email": email}):
-        raise HTTPException(404, "User not found")
-
-    update: dict = {"updated_at": datetime.now(timezone.utc)}
-    if req.name      is not None: update["name"]      = req.name
-    if req.weight_kg is not None: update["weight_kg"] = req.weight_kg
-    if req.height_cm is not None: update["height_cm"] = req.height_cm
-
-    col_users.update_one({"email": email}, {"$set": update})
-    return {"status": "updated"}
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — MEALS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -529,7 +479,6 @@ def analyze_meal(req: MealRequest):
         remaining = 0
         if req.email:
             remaining = _check_and_increment_scan_limit(req.email.strip().lower())
-
         image_part = _b64_to_part(req.image_base64)
         prompt = (
             "Estimate nutrition for the EXACT portion shown. Return ONLY JSON:\n"
