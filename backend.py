@@ -83,8 +83,8 @@ from google import genai
 from google.genai import types
 
 gemini_client       = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MDL_PRIMARY  = "gemini-1.5-flash-8b"  # ✅ fast, cheap, stable
-GEMINI_MDL_FALLBACK = "gemini-1.5-flash"      # ✅ reliable backup
+GEMINI_MDL_PRIMARY  = "gemini-1.5-flash-8b-latest"  # ✅ correct model ID
+GEMINI_MDL_FALLBACK = "gemini-1.5-flash"             # ✅ unchanged
 print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY} (fallback: {GEMINI_MDL_FALLBACK})", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
