@@ -76,15 +76,15 @@ cloudinary.config(
 print("✅  Cloudinary configured", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI INIT
+#  GEMINI INIT  ✅ flash-8b = fastest + cheapest stable model
 # ══════════════════════════════════════════════════════════════════════════════
 
 from google import genai
 from google.genai import types
 
-gemini_client        = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MDL_PRIMARY   = "gemini-2.5-flash"
-GEMINI_MDL_FALLBACK  = "gemini-1.5-flash"
+gemini_client       = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MDL_PRIMARY  = "gemini-1.5-flash-8b"  # ✅ fast, cheap, stable
+GEMINI_MDL_FALLBACK = "gemini-1.5-flash"      # ✅ reliable backup
 print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY} (fallback: {GEMINI_MDL_FALLBACK})", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -109,7 +109,7 @@ print("✅  Keep-alive thread started", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="9.1.0")
+app = FastAPI(title="AERO-FIT API", version="9.2.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -156,60 +156,43 @@ def _b64_to_part(b64: str, mime: str = "image/jpeg") -> types.Part:
         data=base64.b64decode(_strip_b64_prefix(b64)), mime_type=mime)
 
 def _is_overload_error(e: Exception) -> bool:
-    """Returns True if the exception is a Gemini 503 / overload error."""
     msg = str(e).lower()
     return any(k in msg for k in ["503", "unavailable", "high demand", "resource_exhausted", "429"])
 
 def _ask_gemini(parts: list, prompt: str, max_retries: int = 3) -> str:
     """
-    Call Gemini with automatic retry + exponential backoff.
-    Falls back from gemini-2.5-flash → gemini-1.5-flash on persistent 503s.
+    Primary  → gemini-1.5-flash-8b  (fast + cheapest)
+    Fallback → gemini-1.5-flash     (if 8b is somehow overloaded)
+    Each model gets 3 attempts with exponential backoff: 1s → 2s → 4s
     """
     all_parts = list(parts) + [types.Part.from_text(text=prompt)]
     contents  = [types.Content(role="user", parts=all_parts)]
 
-    models_to_try = [GEMINI_MDL_PRIMARY, GEMINI_MDL_FALLBACK]
-
-    for model_idx, model in enumerate(models_to_try):
+    for model in [GEMINI_MDL_PRIMARY, GEMINI_MDL_FALLBACK]:
         for attempt in range(max_retries):
             try:
-                print(f"🤖  Gemini call → model={model} attempt={attempt + 1}", flush=True)
+                print(f"🤖  Gemini → {model} (attempt {attempt + 1})", flush=True)
                 response = gemini_client.models.generate_content(
                     model    = model,
                     contents = contents,
                 )
-                print(f"✅  Gemini OK → model={model}", flush=True)
+                print(f"✅  Gemini OK → {model}", flush=True)
                 return response.text
 
             except Exception as e:
                 if _is_overload_error(e):
                     if attempt < max_retries - 1:
-                        wait = 2 ** attempt   # 1s → 2s → 4s
-                        print(
-                            f"⚠️  Gemini overload on {model} "
-                            f"(attempt {attempt + 1}/{max_retries}), "
-                            f"retrying in {wait}s…",
-                            flush=True,
-                        )
+                        wait = 2 ** attempt  # 1s → 2s → 4s
+                        print(f"⚠️  Overload on {model}, retrying in {wait}s…", flush=True)
                         time.sleep(wait)
                         continue
                     else:
-                        # All retries exhausted on this model → try fallback
-                        print(
-                            f"❌  Gemini {model} failed after {max_retries} attempts, "
-                            f"switching to fallback…",
-                            flush=True,
-                        )
-                        break  # break inner loop → next model
+                        print(f"❌  {model} exhausted, switching to fallback…", flush=True)
+                        break
                 else:
-                    # Non-overload error (bad request, auth, etc.) — raise immediately
-                    raise
+                    raise  # auth error, bad request etc → fail fast
 
-    # Both models failed
-    raise HTTPException(
-        503,
-        "AI is currently busy. Please wait a few seconds and try again. 🙏",
-    )
+    raise HTTPException(503, "AI is currently busy. Please try again in a few seconds. 🙏")
 
 def _extract_json(text: str) -> dict:
     text = re.sub(r"```(?:json)?", "", text).strip()
@@ -334,10 +317,10 @@ class NotificationCreate(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status":  "ok",
-        "version": "9.1.0",
-        "db":      "mongodb",
-        "ai":      GEMINI_MDL_PRIMARY,
+        "status":   "ok",
+        "version":  "9.2.0",
+        "db":       "mongodb",
+        "ai":       GEMINI_MDL_PRIMARY,
         "fallback": GEMINI_MDL_FALLBACK,
     }
 
@@ -541,7 +524,6 @@ def analyze_meal(req: MealRequest):
             '{"name":"","serving_size":"","kcal":0,"protein":0,"carbs":0,"fat":0,"fiber":0,"notes":""}'
         )
 
-        # ✅ _ask_gemini now handles retries + fallback automatically
         text = _ask_gemini([image_part], prompt)
         d    = _extract_json(text)
 
@@ -558,7 +540,7 @@ def analyze_meal(req: MealRequest):
         }
 
     except HTTPException:
-        raise  # pass through 429 (scan limit) and 503 (AI busy) as-is
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, f"Analysis failed: {str(e)}")
