@@ -82,16 +82,17 @@ print("✅  Cloudinary configured", flush=True)
 from google import genai
 from google.genai import types
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MDL    = "gemini-2.5-flash"
-print(f"✅  Gemini ready → {GEMINI_MDL}", flush=True)
+gemini_client        = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MDL_PRIMARY   = "gemini-2.5-flash"
+GEMINI_MDL_FALLBACK  = "gemini-1.5-flash"
+print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY} (fallback: {GEMINI_MDL_FALLBACK})", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  KEEP ALIVE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _keep_alive():
-    time.sleep(60)  # wait 1 min after startup
+    time.sleep(60)
     while True:
         try:
             import requests as _req
@@ -99,7 +100,7 @@ def _keep_alive():
             print("✅  Keep-alive ping sent", flush=True)
         except Exception as e:
             print(f"⚠️  Keep-alive failed: {e}", flush=True)
-        time.sleep(300)  # every 5 minutes
+        time.sleep(300)
 
 threading.Thread(target=_keep_alive, daemon=True).start()
 print("✅  Keep-alive thread started", flush=True)
@@ -108,7 +109,7 @@ print("✅  Keep-alive thread started", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="9.0.0")
+app = FastAPI(title="AERO-FIT API", version="9.1.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -154,13 +155,61 @@ def _b64_to_part(b64: str, mime: str = "image/jpeg") -> types.Part:
     return types.Part.from_bytes(
         data=base64.b64decode(_strip_b64_prefix(b64)), mime_type=mime)
 
-def _ask_gemini(parts: list, prompt: str) -> str:
+def _is_overload_error(e: Exception) -> bool:
+    """Returns True if the exception is a Gemini 503 / overload error."""
+    msg = str(e).lower()
+    return any(k in msg for k in ["503", "unavailable", "high demand", "resource_exhausted", "429"])
+
+def _ask_gemini(parts: list, prompt: str, max_retries: int = 3) -> str:
+    """
+    Call Gemini with automatic retry + exponential backoff.
+    Falls back from gemini-2.5-flash → gemini-1.5-flash on persistent 503s.
+    """
     all_parts = list(parts) + [types.Part.from_text(text=prompt)]
-    response  = gemini_client.models.generate_content(
-        model    = GEMINI_MDL,
-        contents = [types.Content(role="user", parts=all_parts)],
+    contents  = [types.Content(role="user", parts=all_parts)]
+
+    models_to_try = [GEMINI_MDL_PRIMARY, GEMINI_MDL_FALLBACK]
+
+    for model_idx, model in enumerate(models_to_try):
+        for attempt in range(max_retries):
+            try:
+                print(f"🤖  Gemini call → model={model} attempt={attempt + 1}", flush=True)
+                response = gemini_client.models.generate_content(
+                    model    = model,
+                    contents = contents,
+                )
+                print(f"✅  Gemini OK → model={model}", flush=True)
+                return response.text
+
+            except Exception as e:
+                if _is_overload_error(e):
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt   # 1s → 2s → 4s
+                        print(
+                            f"⚠️  Gemini overload on {model} "
+                            f"(attempt {attempt + 1}/{max_retries}), "
+                            f"retrying in {wait}s…",
+                            flush=True,
+                        )
+                        time.sleep(wait)
+                        continue
+                    else:
+                        # All retries exhausted on this model → try fallback
+                        print(
+                            f"❌  Gemini {model} failed after {max_retries} attempts, "
+                            f"switching to fallback…",
+                            flush=True,
+                        )
+                        break  # break inner loop → next model
+                else:
+                    # Non-overload error (bad request, auth, etc.) — raise immediately
+                    raise
+
+    # Both models failed
+    raise HTTPException(
+        503,
+        "AI is currently busy. Please wait a few seconds and try again. 🙏",
     )
-    return response.text
 
 def _extract_json(text: str) -> dict:
     text = re.sub(r"```(?:json)?", "", text).strip()
@@ -284,7 +333,13 @@ class NotificationCreate(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "9.0.0", "db": "mongodb", "ai": GEMINI_MDL}
+    return {
+        "status":  "ok",
+        "version": "9.1.0",
+        "db":      "mongodb",
+        "ai":      GEMINI_MDL_PRIMARY,
+        "fallback": GEMINI_MDL_FALLBACK,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — ADMIN AUTH
@@ -479,13 +534,17 @@ def analyze_meal(req: MealRequest):
         remaining = 0
         if req.email:
             remaining = _check_and_increment_scan_limit(req.email.strip().lower())
+
         image_part = _b64_to_part(req.image_base64)
         prompt = (
             "Estimate nutrition for the EXACT portion shown. Return ONLY JSON:\n"
             '{"name":"","serving_size":"","kcal":0,"protein":0,"carbs":0,"fat":0,"fiber":0,"notes":""}'
         )
+
+        # ✅ _ask_gemini now handles retries + fallback automatically
         text = _ask_gemini([image_part], prompt)
         d    = _extract_json(text)
+
         return {
             "name":            str(d.get("name",         "Meal")),
             "serving_size":    str(d.get("serving_size", "1 serving")),
@@ -497,11 +556,12 @@ def analyze_meal(req: MealRequest):
             "notes":           str(d.get("notes", "")),
             "scans_remaining": remaining,
         }
+
     except HTTPException:
-        raise
+        raise  # pass through 429 (scan limit) and 503 (AI busy) as-is
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"Analysis failed: {str(e)}")
 
 @app.post("/log-meal")
 def log_meal(req: LogMealRequest):
