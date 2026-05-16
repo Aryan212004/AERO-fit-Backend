@@ -344,6 +344,13 @@ def delete_banner(banner_id: str):
         raise HTTPException(404, "Banner not found")
     return {"status": "deleted"}
 
+@app.delete("/notifications/{notification_id}")
+def delete_notification(notification_id: str):
+    result = col_notifs.delete_one({"notification_id": notification_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Notification not found")
+    return {"status": "deleted"}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
