@@ -1,4 +1,4 @@
-import os, sys, json, re, bcrypt, uuid, base64, traceback
+import os, sys, json, re, bcrypt, uuid, base64, traceback, threading, time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
@@ -31,7 +31,6 @@ CLOUDINARY_API_KEY = _require("CLOUDINARY_API_KEY")
 CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
 SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
 
-# Admin credentials — set these in Render environment variables
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "aerofit2025"
 
@@ -47,14 +46,12 @@ _mongo_client: MongoClient = MongoClient(MONGO_URI)
 _db_name = MONGO_URI.rsplit("/", 1)[-1].split("?")[0].strip() or "aerofitdb"
 mdb = _mongo_client[_db_name]
 
-# Collections
 col_users:       Collection = mdb["users"]
 col_meals:       Collection = mdb["meals"]
 col_banners:     Collection = mdb["banners"]
 col_notifs:      Collection = mdb["notifications"]
 col_scan_limits: Collection = mdb["scan_limits"]
 
-# Indexes
 col_users.create_index("email", unique=True)
 col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
 col_banners.create_index("created_at")
@@ -90,6 +87,24 @@ GEMINI_MDL    = "gemini-2.5-flash"
 print(f"✅  Gemini ready → {GEMINI_MDL}", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  KEEP ALIVE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _keep_alive():
+    time.sleep(60)  # wait 1 min after startup
+    while True:
+        try:
+            import requests as _req
+            _req.get("https://aero-fit-backend.onrender.com/health", timeout=10)
+            print("✅  Keep-alive ping sent", flush=True)
+        except Exception as e:
+            print(f"⚠️  Keep-alive failed: {e}", flush=True)
+        time.sleep(300)  # every 5 minutes
+
+threading.Thread(target=_keep_alive, daemon=True).start()
+print("✅  Keep-alive thread started", flush=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -102,7 +117,6 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
     "http://127.0.0.1:3000",
-    # "https://your-deployed-frontend.com",  # ← uncomment for prod
 ]
 
 app.add_middleware(
@@ -134,13 +148,11 @@ async def preflight_handler(request: Request, rest_of_path: str):
 def _strip_b64_prefix(b64: str) -> str:
     return b64.split(",", 1)[1].strip() if "," in b64 else b64.strip()
 
-
 def _b64_to_part(b64: str, mime: str = "image/jpeg") -> types.Part:
     if not b64:
         raise ValueError("Empty image data")
     return types.Part.from_bytes(
         data=base64.b64decode(_strip_b64_prefix(b64)), mime_type=mime)
-
 
 def _ask_gemini(parts: list, prompt: str) -> str:
     all_parts = list(parts) + [types.Part.from_text(text=prompt)]
@@ -150,7 +162,6 @@ def _ask_gemini(parts: list, prompt: str) -> str:
     )
     return response.text
 
-
 def _extract_json(text: str) -> dict:
     text = re.sub(r"```(?:json)?", "", text).strip()
     m    = re.search(r"\{.*\}", text, re.DOTALL)
@@ -158,16 +169,13 @@ def _extract_json(text: str) -> dict:
         raise ValueError(f"No JSON found in Gemini response: {text[:300]}")
     return json.loads(m.group())
 
-
 def _safe_int(val, default: int = 0) -> int:
     try:
         return int(float(str(val).replace("~", "").strip()))
     except Exception:
         return default
 
-
 def _doc(d: dict) -> dict:
-    """Strip MongoDB _id before returning to client."""
     d.pop("_id", None)
     return d
 
@@ -178,8 +186,8 @@ def _doc(d: dict) -> dict:
 def upload_image(base64_str: str, folder: str, public_id: str = None) -> str:
     if not base64_str:
         return ""
-    raw      = _strip_b64_prefix(base64_str)
-    data_uri = f"data:image/jpeg;base64,{raw}"
+    raw       = _strip_b64_prefix(base64_str)
+    data_uri  = f"data:image/jpeg;base64,{raw}"
     public_id = public_id or str(uuid.uuid4())
     result = cloudinary.uploader.upload(
         data_uri,
@@ -310,7 +318,6 @@ def add_user(req: AddUserRequest):
     })
     return {"status": "created", "email": email}
 
-
 @app.get("/admin/users")
 def list_users():
     docs = list(col_users.find().sort("created_at", DESCENDING))
@@ -326,7 +333,6 @@ def list_users():
         for d in docs
     ]
 
-
 @app.delete("/admin/users/{email}")
 def remove_user(email: str):
     result = col_users.delete_one({"email": email.lower()})
@@ -335,7 +341,7 @@ def remove_user(email: str):
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — USER AUTH (app login)
+#  ROUTES — USER AUTH
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/user/login")
@@ -356,7 +362,6 @@ def user_login(req: UserLogin):
         },
     }
 
-
 @app.get("/user/{email}")
 def get_user(email: str):
     user = col_users.find_one({"email": email.lower()})
@@ -368,7 +373,6 @@ def get_user(email: str):
         "weight_kg": user["weight_kg"],
         "height_cm": user["height_cm"],
     }
-
 
 @app.put("/user/{email}")
 def update_user(email: str, req: UserUpdate):
@@ -404,13 +408,11 @@ def create_banner(req: BannerCreate):
     col_banners.insert_one(doc)
     return {"status": "created", "banner_id": banner_id, "image_url": image_url}
 
-
 @app.get("/banners")
 def list_banners(screen: str = None):
     query = {"screen": screen} if screen else {}
     docs  = list(col_banners.find(query).sort("created_at", DESCENDING))
     return [_doc(d) for d in docs]
-
 
 @app.delete("/banners/{banner_id}")
 def delete_banner(banner_id: str):
@@ -439,12 +441,10 @@ def create_notification(req: NotificationCreate):
     col_notifs.insert_one(doc)
     return {"status": "sent", "notification_id": notif_id}
 
-
 @app.get("/notifications")
 def list_notifications():
     docs = list(col_notifs.find().sort("sent_at", DESCENDING).limit(50))
     return [_doc(d) for d in docs]
-
 
 @app.delete("/notifications/{notification_id}")
 def delete_notification(notification_id: str):
@@ -503,7 +503,6 @@ def analyze_meal(req: MealRequest):
         traceback.print_exc()
         raise HTTPException(500, str(e))
 
-
 @app.post("/log-meal")
 def log_meal(req: LogMealRequest):
     try:
@@ -535,7 +534,6 @@ def log_meal(req: LogMealRequest):
         traceback.print_exc()
         raise HTTPException(500, f"Meal log failed: {str(e)}")
 
-
 @app.get("/meals/{email}")
 def get_meals(email: str, days: int = 1):
     since = datetime.now(timezone.utc) - timedelta(days=days)
@@ -546,14 +544,12 @@ def get_meals(email: str, days: int = 1):
     )
     return [_doc(d) for d in docs]
 
-
 @app.delete("/meal/{meal_id}")
 def delete_meal(meal_id: str):
     result = col_meals.delete_one({"meal_id": meal_id})
     if result.deleted_count == 0:
         raise HTTPException(404, "Meal not found")
     return {"status": "deleted"}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
