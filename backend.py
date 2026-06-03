@@ -694,6 +694,14 @@ def user_login(req: UserLogin):
         raise HTTPException(401, "Invalid email or password")
     if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
         raise HTTPException(401, "Invalid email or password")
+    
+    # Look up gym name if user has a gym_id
+    gym_name = ""
+    if user.get("gym_id"):
+        gym = col_gyms.find_one({"gym_id": user["gym_id"]})
+        if gym:
+            gym_name = gym.get("name", "")
+    
     return {
         "status": "ok",
         "user": {
@@ -702,6 +710,7 @@ def user_login(req: UserLogin):
             "weight_kg": user["weight_kg"],
             "height_cm": user["height_cm"],
             "gym_id":    user.get("gym_id"),
+            "gym_name":  gym_name,           # ← ADD THIS
         },
     }
 
@@ -710,12 +719,20 @@ def get_user(email: str):
     user = col_users.find_one({"email": email.lower()})
     if not user:
         raise HTTPException(404, "User not found")
+    
+    gym_name = ""
+    if user.get("gym_id"):
+        gym = col_gyms.find_one({"gym_id": user["gym_id"]})
+        if gym:
+            gym_name = gym.get("name", "")
+    
     return {
         "email":     user["email"],
         "name":      user["name"],
         "weight_kg": user["weight_kg"],
         "height_cm": user["height_cm"],
         "gym_id":    user.get("gym_id"),
+        "gym_name":  gym_name,               # ← ADD THIS
     }
 
 @app.put("/user/{email}")
