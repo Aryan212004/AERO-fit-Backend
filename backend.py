@@ -31,8 +31,13 @@ CLOUDINARY_API_KEY = _require("CLOUDINARY_API_KEY")
 CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
 SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
 
+# ── Gym-level admin (one per gym dashboard) ───────────────────────────────────
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "aerofit2025"
+
+# ── Alpha / Super admin (you — platform owner) ────────────────────────────────
+ALPHA_USERNAME = os.environ.get("ALPHA_USERNAME", "superadmin").strip()
+ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONGODB INIT
@@ -46,17 +51,30 @@ _mongo_client: MongoClient = MongoClient(MONGO_URI)
 _db_name = MONGO_URI.rsplit("/", 1)[-1].split("?")[0].strip() or "aerofitdb"
 mdb = _mongo_client[_db_name]
 
+# ── Existing collections ──────────────────────────────────────────────────────
 col_users:       Collection = mdb["users"]
 col_meals:       Collection = mdb["meals"]
 col_banners:     Collection = mdb["banners"]
 col_notifs:      Collection = mdb["notifications"]
 col_scan_limits: Collection = mdb["scan_limits"]
 
+# ── New platform collections (alpha admin) ────────────────────────────────────
+col_gyms:         Collection = mdb["platform_gyms"]
+col_gym_admins:   Collection = mdb["platform_gym_admins"]
+
+# ── Indexes — existing ────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
 col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
 col_banners.create_index("created_at")
 col_notifs.create_index("sent_at")
 col_scan_limits.create_index([("email", 1), ("date", 1)], unique=True)
+
+# ── Indexes — platform ────────────────────────────────────────────────────────
+col_gyms.create_index("gym_id", unique=True)
+col_gyms.create_index("admin_email")
+col_gym_admins.create_index("admin_id", unique=True)
+col_gym_admins.create_index("email", unique=True)
+col_gym_admins.create_index("gym_id")
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -76,15 +94,15 @@ cloudinary.config(
 print("✅  Cloudinary configured", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GEMINI INIT  ✅ flash-8b = fastest + cheapest stable model
+#  GEMINI INIT
 # ══════════════════════════════════════════════════════════════════════════════
 
 from google import genai
 from google.genai import types
 
 gemini_client       = genai.Client(api_key=GEMINI_API_KEY)
-GEMINI_MDL_PRIMARY  = "gemini-2.5-flash-lite"  # ✅ cheap, fast, works on v1beta
-GEMINI_MDL_FALLBACK = "gemini-2.5-flash"        # ✅ reliable fallback
+GEMINI_MDL_PRIMARY  = "gemini-2.5-flash-lite"
+GEMINI_MDL_FALLBACK = "gemini-2.5-flash"
 print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY} (fallback: {GEMINI_MDL_FALLBACK})", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -109,7 +127,7 @@ print("✅  Keep-alive thread started", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="9.2.0")
+app = FastAPI(title="AERO-FIT API", version="10.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -160,11 +178,6 @@ def _is_overload_error(e: Exception) -> bool:
     return any(k in msg for k in ["503", "unavailable", "high demand", "resource_exhausted", "429"])
 
 def _ask_gemini(parts: list, prompt: str, max_retries: int = 3) -> str:
-    """
-    Primary  → gemini-1.5-flash-8b  (fast + cheapest)
-    Fallback → gemini-1.5-flash     (if 8b is somehow overloaded)
-    Each model gets 3 attempts with exponential backoff: 1s → 2s → 4s
-    """
     all_parts = list(parts) + [types.Part.from_text(text=prompt)]
     contents  = [types.Content(role="user", parts=all_parts)]
 
@@ -178,11 +191,10 @@ def _ask_gemini(parts: list, prompt: str, max_retries: int = 3) -> str:
                 )
                 print(f"✅  Gemini OK → {model}", flush=True)
                 return response.text
-
             except Exception as e:
                 if _is_overload_error(e):
                     if attempt < max_retries - 1:
-                        wait = 2 ** attempt  # 1s → 2s → 4s
+                        wait = 2 ** attempt
                         print(f"⚠️  Overload on {model}, retrying in {wait}s…", flush=True)
                         time.sleep(wait)
                         continue
@@ -190,7 +202,7 @@ def _ask_gemini(parts: list, prompt: str, max_retries: int = 3) -> str:
                         print(f"❌  {model} exhausted, switching to fallback…", flush=True)
                         break
                 else:
-                    raise  # auth error, bad request etc → fail fast
+                    raise
 
     raise HTTPException(503, "AI is currently busy. Please try again in a few seconds. 🙏")
 
@@ -210,6 +222,11 @@ def _safe_int(val, default: int = 0) -> int:
 def _doc(d: dict) -> dict:
     d.pop("_id", None)
     return d
+
+def _fmt_dt(dt) -> str:
+    if isinstance(dt, datetime):
+        return dt.isoformat()
+    return str(dt) if dt else ""
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS — CLOUDINARY IMAGE UPLOAD
@@ -256,7 +273,7 @@ def _check_and_increment_scan_limit(email: str) -> int:
         return SCAN_LIMIT - 1
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PYDANTIC MODELS
+#  PYDANTIC MODELS — EXISTING
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AdminLogin(BaseModel):
@@ -311,6 +328,35 @@ class NotificationCreate(BaseModel):
     scheduled_at: Optional[str] = None
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PYDANTIC MODELS — PLATFORM (ALPHA ADMIN)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AlphaLogin(BaseModel):
+    username: str
+    password: str
+
+class GymCreate(BaseModel):
+    name:        str
+    city:        str
+    plan:        str = "Starter"   # "Starter" | "Pro" | "Trial"
+    admin_email: str
+    admin_name:  str = "Admin"
+    admin_password: str = ""       # optional — defaults to gym name slug
+
+class GymUpdate(BaseModel):
+    name:        Optional[str] = None
+    city:        Optional[str] = None
+    plan:        Optional[str] = None
+    status:      Optional[str] = None
+    members:     Optional[int] = None
+    revenue:     Optional[int] = None
+
+class GymAdminUpdate(BaseModel):
+    name:   Optional[str] = None
+    email:  Optional[str] = None
+    status: Optional[str] = None   # "active" | "inactive"
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -318,14 +364,14 @@ class NotificationCreate(BaseModel):
 def health():
     return {
         "status":   "ok",
-        "version":  "9.2.0",
+        "version":  "10.0.0",
         "db":       "mongodb",
         "ai":       GEMINI_MDL_PRIMARY,
         "fallback": GEMINI_MDL_FALLBACK,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — ADMIN AUTH
+#  ROUTES — GYM ADMIN AUTH  (existing, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/admin/login")
@@ -335,7 +381,283 @@ def admin_login(req: AdminLogin):
     return {"status": "ok", "role": "admin"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — ADMIN USER MANAGEMENT
+#  ROUTES — ALPHA ADMIN AUTH
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/alpha/login")
+def alpha_login(req: AlphaLogin):
+    """
+    Alpha (super) admin login.
+    Credentials come from env vars ALPHA_USERNAME / ALPHA_PASSWORD.
+    """
+    if req.username != ALPHA_USERNAME or req.password != ALPHA_PASSWORD:
+        raise HTTPException(401, "Invalid alpha admin credentials")
+    return {"status": "ok", "role": "alpha"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — PLATFORM STATS  (alpha admin dashboard)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/alpha/stats")
+def platform_stats():
+    """
+    Top-level numbers shown on the alpha admin dashboard.
+    """
+    gyms        = list(col_gyms.find())
+    total_gyms  = len(gyms)
+    total_members = sum(g.get("members", 0) for g in gyms)
+    total_revenue = sum(g.get("revenue", 0) for g in gyms)
+    pro_gyms    = sum(1 for g in gyms if g.get("plan") == "Pro")
+    trial_gyms  = sum(1 for g in gyms if g.get("status") == "trial")
+    active_gyms = sum(1 for g in gyms if g.get("status") == "active")
+
+    return {
+        "total_gyms":     total_gyms,
+        "active_gyms":    active_gyms,
+        "trial_gyms":     trial_gyms,
+        "pro_gyms":       pro_gyms,
+        "total_members":  total_members,
+        "total_revenue":  total_revenue,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — GYMS  (alpha admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/alpha/gyms")
+def list_gyms():
+    """Return all gyms on the platform."""
+    docs = list(col_gyms.find().sort("created_at", DESCENDING))
+    return [_doc(d) for d in docs]
+
+
+@app.post("/alpha/gyms")
+def create_gym(req: GymCreate):
+    """
+    Create a new gym AND its linked gym admin account in one call.
+    Also registers the gym admin as a user in the existing /admin/login
+    flow so they can log into their own dashboard.
+    """
+    admin_email = req.admin_email.strip().lower()
+
+    # Prevent duplicate gym admin emails
+    if col_gym_admins.find_one({"email": admin_email}):
+        raise HTTPException(409, "An admin with that email already exists")
+
+    gym_id   = "gym_" + str(uuid.uuid4())[:8]
+    admin_id = "adm_" + str(uuid.uuid4())[:8]
+
+    # Default password = slugified gym name if not provided
+    raw_password = req.admin_password.strip() or re.sub(r"[^a-z0-9]", "", req.name.lower()) + "2025"
+
+    now = datetime.now(timezone.utc)
+
+    # ── Save gym ──────────────────────────────────────────────────────────────
+    gym_doc = {
+        "gym_id":      gym_id,
+        "name":        req.name.strip(),
+        "city":        req.city.strip(),
+        "plan":        req.plan,
+        "status":      "trial" if req.plan == "Trial" else "active",
+        "members":     0,
+        "revenue":     0,
+        "admin_email": admin_email,
+        "admin_id":    admin_id,
+        "created_at":  now,
+    }
+    col_gyms.insert_one(gym_doc)
+
+    # ── Save gym admin ────────────────────────────────────────────────────────
+    hashed = bcrypt.hashpw(raw_password.encode(), bcrypt.gensalt()).decode()
+    admin_doc = {
+        "admin_id":   admin_id,
+        "gym_id":     gym_id,
+        "gym_name":   req.name.strip(),
+        "name":       req.admin_name.strip(),
+        "email":      admin_email,
+        "password":   hashed,
+        "status":     "active",
+        "created_at": now,
+    }
+    col_gym_admins.insert_one(admin_doc)
+
+    print(f"✅  Gym created → {gym_id}  admin → {admin_email}", flush=True)
+
+    return {
+        "status":        "created",
+        "gym_id":        gym_id,
+        "admin_id":      admin_id,
+        "admin_email":   admin_email,
+        "admin_password": raw_password,   # returned once so alpha admin can share it
+    }
+
+
+@app.get("/alpha/gyms/{gym_id}")
+def get_gym(gym_id: str):
+    """Return a single gym with its admin info."""
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+    gym = _doc(gym)
+
+    admin = col_gym_admins.find_one({"gym_id": gym_id})
+    if admin:
+        admin = _doc(admin)
+        admin.pop("password", None)
+        gym["admin"] = admin
+
+    return gym
+
+
+@app.patch("/alpha/gyms/{gym_id}")
+def update_gym(gym_id: str, req: GymUpdate):
+    """Update plan, status, member count, or revenue for a gym."""
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    update: dict = {"updated_at": datetime.now(timezone.utc)}
+    if req.name    is not None: update["name"]    = req.name
+    if req.city    is not None: update["city"]    = req.city
+    if req.plan    is not None: update["plan"]    = req.plan
+    if req.status  is not None: update["status"]  = req.status
+    if req.members is not None: update["members"] = req.members
+    if req.revenue is not None: update["revenue"] = req.revenue
+
+    col_gyms.update_one({"gym_id": gym_id}, {"$set": update})
+    return {"status": "updated", "gym_id": gym_id}
+
+
+@app.delete("/alpha/gyms/{gym_id}")
+def delete_gym(gym_id: str):
+    """
+    Remove a gym and its linked admin account.
+    Does NOT remove the gym's end-users (they belong to col_users).
+    """
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    col_gyms.delete_one({"gym_id": gym_id})
+    col_gym_admins.delete_one({"gym_id": gym_id})
+
+    print(f"🗑️  Gym deleted → {gym_id}", flush=True)
+    return {"status": "deleted", "gym_id": gym_id}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — GYM ADMINS  (alpha admin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/alpha/admins")
+def list_gym_admins():
+    """Return all gym admin accounts."""
+    docs = list(col_gym_admins.find().sort("created_at", DESCENDING))
+    result = []
+    for d in docs:
+        d = _doc(d)
+        d.pop("password", None)   # never expose hashed password
+        result.append(d)
+    return result
+
+
+@app.post("/alpha/admins/{gym_id}")
+def create_gym_admin(gym_id: str, req: GymAdminUpdate):
+    """
+    Add a second admin to an existing gym
+    (e.g. if the gym owner wants a manager account too).
+    Requires at least name + email in the request body.
+    """
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    email = (req.email or "").strip().lower()
+    if not email:
+        raise HTTPException(400, "email is required")
+    if col_gym_admins.find_one({"email": email}):
+        raise HTTPException(409, "Admin email already exists")
+
+    admin_id = "adm_" + str(uuid.uuid4())[:8]
+    raw_pw   = re.sub(r"[^a-z0-9]", "", gym["name"].lower()) + "2025"
+    hashed   = bcrypt.hashpw(raw_pw.encode(), bcrypt.gensalt()).decode()
+
+    doc = {
+        "admin_id":   admin_id,
+        "gym_id":     gym_id,
+        "gym_name":   gym["name"],
+        "name":       (req.name or "Admin").strip(),
+        "email":      email,
+        "password":   hashed,
+        "status":     "active",
+        "created_at": datetime.now(timezone.utc),
+    }
+    col_gym_admins.insert_one(doc)
+
+    return {
+        "status":           "created",
+        "admin_id":         admin_id,
+        "admin_email":      email,
+        "admin_password":   raw_pw,
+    }
+
+
+@app.patch("/alpha/admins/{admin_id}")
+def update_gym_admin(admin_id: str, req: GymAdminUpdate):
+    """Edit name, email, or active/inactive status of a gym admin."""
+    adm = col_gym_admins.find_one({"admin_id": admin_id})
+    if not adm:
+        raise HTTPException(404, "Admin not found")
+
+    update: dict = {"updated_at": datetime.now(timezone.utc)}
+    if req.name   is not None: update["name"]   = req.name
+    if req.email  is not None: update["email"]  = req.email.strip().lower()
+    if req.status is not None: update["status"] = req.status
+
+    col_gym_admins.update_one({"admin_id": admin_id}, {"$set": update})
+    return {"status": "updated", "admin_id": admin_id}
+
+
+@app.delete("/alpha/admins/{admin_id}")
+def delete_gym_admin(admin_id: str):
+    """Remove a gym admin account."""
+    result = col_gym_admins.delete_one({"admin_id": admin_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Admin not found")
+    return {"status": "deleted", "admin_id": admin_id}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — GYM ADMIN LOGIN  (gym-level dashboard auth)
+#  Gym admins created via /alpha/gyms log in here instead of /admin/login
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/gym-admin/login")
+def gym_admin_login(req: AdminLogin):
+    """
+    Used by gym-specific admin dashboards.
+    Looks up the gym admin in platform_gym_admins by username=email.
+    """
+    email = req.username.strip().lower()
+    adm   = col_gym_admins.find_one({"email": email})
+    if not adm:
+        raise HTTPException(401, "Invalid credentials")
+    if adm.get("status") == "inactive":
+        raise HTTPException(403, "This admin account has been deactivated")
+    if not bcrypt.checkpw(req.password.encode(), adm["password"].encode()):
+        raise HTTPException(401, "Invalid credentials")
+
+    return {
+        "status":    "ok",
+        "role":      "gym_admin",
+        "admin_id":  adm["admin_id"],
+        "gym_id":    adm["gym_id"],
+        "gym_name":  adm["gym_name"],
+        "name":      adm["name"],
+        "email":     adm["email"],
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — ADMIN USER MANAGEMENT  (existing, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/admin/add-user")
@@ -365,8 +687,7 @@ def list_users():
             "name":       d["name"],
             "weight_kg":  d["weight_kg"],
             "height_cm":  d["height_cm"],
-            "created_at": d.get("created_at", "").isoformat()
-                          if isinstance(d.get("created_at"), datetime) else "",
+            "created_at": _fmt_dt(d.get("created_at")),
         }
         for d in docs
     ]
@@ -379,7 +700,7 @@ def remove_user(email: str):
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — USER AUTH
+#  ROUTES — USER AUTH  (existing, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/user/login")
@@ -425,7 +746,7 @@ def update_user(email: str, req: UserUpdate):
     return {"status": "updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — BANNERS
+#  ROUTES — BANNERS  (existing, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/banners")
@@ -460,7 +781,7 @@ def delete_banner(banner_id: str):
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — NOTIFICATIONS
+#  ROUTES — NOTIFICATIONS  (existing, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/notifications")
@@ -492,7 +813,7 @@ def delete_notification(notification_id: str):
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — SCAN LIMIT
+#  ROUTES — SCAN LIMIT  (existing, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/scan-limit/{email}")
@@ -508,7 +829,7 @@ def get_scan_limit(email: str):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — MEALS
+#  ROUTES — MEALS  (existing, unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/analyze-meal")
