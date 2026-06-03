@@ -34,8 +34,8 @@ SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
 # ── Alpha / Super admin (platform owner) ──────────────────────────────────────
 # Set ALPHA_USERNAME and ALPHA_PASSWORD in your Render environment variables.
 # Example: ALPHA_USERNAME=superadmin  ALPHA_PASSWORD=some_strong_password
-ALPHA_USERNAME = _require("ALPHA_USERNAME")
-ALPHA_PASSWORD = _require("ALPHA_PASSWORD")
+ALPHA_USERNAME = os.environ.get("ALPHA_USERNAME", "superadmin").strip()
+ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONGODB INIT
