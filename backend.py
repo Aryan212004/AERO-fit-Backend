@@ -32,8 +32,6 @@ CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
 SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
 
 # ── Alpha / Super admin (platform owner) ──────────────────────────────────────
-# Set ALPHA_USERNAME and ALPHA_PASSWORD in your Render environment variables.
-# Example: ALPHA_USERNAME=superadmin  ALPHA_PASSWORD=some_strong_password
 ALPHA_USERNAME = os.environ.get("ALPHA_USERNAME", "superadmin").strip()
 ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 
@@ -56,13 +54,15 @@ col_notifs:      Collection = mdb["notifications"]
 col_scan_limits: Collection = mdb["scan_limits"]
 col_gyms:        Collection = mdb["platform_gyms"]
 col_gym_admins:  Collection = mdb["platform_gym_admins"]
-col_user_ids:    Collection = mdb["gym_user_ids"]   # ← NEW: one-time access codes
+col_user_ids:    Collection = mdb["gym_user_ids"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
 col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
 col_banners.create_index("created_at")
+col_banners.create_index([("gym_id", 1), ("created_at", DESCENDING)])  # ✅ NEW
 col_notifs.create_index("sent_at")
+col_notifs.create_index([("gym_id", 1), ("sent_at", DESCENDING)])  # ✅ NEW
 col_scan_limits.create_index([("email", 1), ("date", 1)], unique=True)
 col_gyms.create_index("gym_id", unique=True)
 col_gyms.create_index("admin_email")
@@ -237,7 +237,6 @@ def _check_and_increment_scan_limit(email: str) -> int:
     col_scan_limits.insert_one({**filter, "count": 1})
     return SCAN_LIMIT - 1
 
-# ── User ID code generator ─────────────────────────────────────────────────────
 def _generate_code() -> str:
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "AF-" + "".join(__import__("random").choice(chars) for _ in range(4))
@@ -260,8 +259,8 @@ class AddUserRequest(BaseModel):
     password:  str
     weight_kg: float
     height_cm: float
-    gym_id:    Optional[str] = None   # optional gym association
-    user_id:   Optional[str] = None   # one-time access code to consume
+    gym_id:    Optional[str] = None
+    user_id:   Optional[str] = None
 
 class UserLogin(BaseModel):
     email:    str
@@ -287,6 +286,7 @@ class LogMealRequest(BaseModel):
     serving_size: str
     image_base64: Optional[str] = ""
 
+# ✅ FIXED: Added gym_id field
 class BannerCreate(BaseModel):
     title:        str
     screen:       str           = "home"
@@ -294,7 +294,9 @@ class BannerCreate(BaseModel):
     expires_at:   Optional[str] = None
     deep_link:    Optional[str] = None
     image_base64: Optional[str] = None
+    gym_id:       str           # ✅ REQUIRED: which gym owns this banner
 
+# ✅ FIXED: Added gym_id field
 class NotificationCreate(BaseModel):
     title:        str
     body:         str
@@ -302,6 +304,7 @@ class NotificationCreate(BaseModel):
     segments:     list[str] = ["all"]
     deep_link:    Optional[str] = None
     scheduled_at: Optional[str] = None
+    gym_id:       str           # ✅ REQUIRED: which gym owns this notification
 
 class GymCreate(BaseModel):
     name:           str
@@ -325,10 +328,10 @@ class GymAdminUpdate(BaseModel):
     status: Optional[str] = None
 
 class ValidateUserIdRequest(BaseModel):
-    user_id: str   # the AF-XXXX code sent from the Flutter app
+    user_id: str
 
 class GenerateUserIdsRequest(BaseModel):
-    count: int = 1   # how many codes to generate (1–50)
+    count: int = 1
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -540,11 +543,6 @@ def delete_gym_admin(admin_id: str):
 
 @app.post("/gym/{gym_id}/user-ids/generate")
 def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
-    """
-    Gym admin calls this to mint one-time access codes.
-    The React dashboard can call this instead of storing codes in localStorage.
-    count: 1–50
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
 
@@ -553,7 +551,6 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
     now   = datetime.now(timezone.utc)
 
     for _ in range(count):
-        # Retry on the rare collision
         for _attempt in range(10):
             code = _generate_code()
             if not col_user_ids.find_one({"code": code}):
@@ -561,10 +558,10 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
         col_user_ids.insert_one({
             "gym_id":     gym_id,
             "code":       code,
-            "status":     "active",   # active | used
+            "status":     "active",
             "created_at": now,
             "used_at":    None,
-            "used_by":    None,       # filled with email on consumption
+            "used_by":    None,
         })
         codes.append(code)
 
@@ -574,9 +571,6 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
 
 @app.get("/gym/{gym_id}/user-ids")
 def list_user_ids(gym_id: str):
-    """
-    Return all codes for a gym so the React dashboard can display them.
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
     docs = list(col_user_ids.find({"gym_id": gym_id}).sort("created_at", DESCENDING))
@@ -585,11 +579,6 @@ def list_user_ids(gym_id: str):
 
 @app.post("/gym/{gym_id}/validate-user-id")
 def validate_user_id(gym_id: str, req: ValidateUserIdRequest):
-    """
-    Flutter app calls this BEFORE registration to check the code is valid.
-    Does NOT consume the code — consumption happens at /admin/add-user.
-    Returns { valid: true/false }.
-    """
     code = req.user_id.strip().upper()
     doc  = col_user_ids.find_one({"gym_id": gym_id, "code": code})
     if not doc:
@@ -601,9 +590,6 @@ def validate_user_id(gym_id: str, req: ValidateUserIdRequest):
 
 @app.delete("/gym/{gym_id}/user-ids/{code}")
 def revoke_user_id(gym_id: str, code: str):
-    """
-    Gym admin revokes an unused code.
-    """
     code = code.strip().upper()
     result = col_user_ids.delete_one({"gym_id": gym_id, "code": code, "status": "active"})
     if result.deleted_count == 0:
@@ -616,18 +602,12 @@ def revoke_user_id(gym_id: str, code: str):
 
 @app.post("/admin/add-user")
 def add_user(req: AddUserRequest):
-    """
-    Register a new end-user.
-    If gym_id + user_id are provided the one-time code is validated
-    and consumed atomically before the account is created.
-    """
     email = req.email.strip().lower()
     if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
         raise HTTPException(400, "Invalid email address")
     if col_users.find_one({"email": email}):
         raise HTTPException(409, "User already exists")
 
-    # ── Validate & consume the one-time code if provided ──────────────────────
     if req.gym_id and req.user_id:
         gym_id = req.gym_id.strip()
         code   = req.user_id.strip().upper()
@@ -636,7 +616,6 @@ def add_user(req: AddUserRequest):
             raise HTTPException(400, "Invalid User ID for this gym")
         if doc.get("status") != "active":
             raise HTTPException(400, "This User ID has already been used")
-        # Mark as used atomically
         col_user_ids.update_one(
             {"gym_id": gym_id, "code": code, "status": "active"},
             {"$set": {
@@ -645,7 +624,6 @@ def add_user(req: AddUserRequest):
                 "used_by": email,
             }},
         )
-        # Increment gym member count
         col_gyms.update_one({"gym_id": gym_id}, {"$inc": {"members": 1}})
 
     hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
@@ -695,7 +673,6 @@ def user_login(req: UserLogin):
     if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
         raise HTTPException(401, "Invalid email or password")
     
-    # Look up gym name if user has a gym_id
     gym_name = ""
     if user.get("gym_id"):
         gym = col_gyms.find_one({"gym_id": user["gym_id"]})
@@ -710,7 +687,7 @@ def user_login(req: UserLogin):
             "weight_kg": user["weight_kg"],
             "height_cm": user["height_cm"],
             "gym_id":    user.get("gym_id"),
-            "gym_name":  gym_name,           # ← ADD THIS
+            "gym_name":  gym_name,
         },
     }
 
@@ -732,7 +709,7 @@ def get_user(email: str):
         "weight_kg": user["weight_kg"],
         "height_cm": user["height_cm"],
         "gym_id":    user.get("gym_id"),
-        "gym_name":  gym_name,               # ← ADD THIS
+        "gym_name":  gym_name,
     }
 
 @app.put("/user/{email}")
@@ -748,15 +725,27 @@ def update_user(email: str, req: UserUpdate):
     return {"status": "updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — BANNERS
+#  ROUTES — BANNERS (✅ SECURED WITH GYM ISOLATION)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/banners")
-def create_banner(req: BannerCreate):
+# ✅ SECURE: gym_id in URL path, stored in document, filtered on queries
+@app.post("/gym/{gym_id}/banners")
+def create_banner(gym_id: str, req: BannerCreate):
+    """
+    ✅ SECURE: gym_id is in the URL path, not just a body parameter
+    Only this gym can create banners for itself
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    
+    if req.gym_id != gym_id:
+        raise HTTPException(403, "Cannot create banners for a different gym")
+
     banner_id = str(uuid.uuid4())
     image_url = upload_image(req.image_base64 or "", folder="aerofitdb/banners", public_id=banner_id)
     doc = {
         "banner_id":  banner_id,
+        "gym_id":     gym_id,        # ✅ STORE gym_id
         "title":      req.title,
         "screen":     req.screen,
         "status":     req.status,
@@ -766,30 +755,61 @@ def create_banner(req: BannerCreate):
         "created_at": datetime.now(timezone.utc),
     }
     col_banners.insert_one(doc)
+    print(f"✅  Banner created → {banner_id} for gym {gym_id}", flush=True)
     return {"status": "created", "banner_id": banner_id, "image_url": image_url}
 
-@app.get("/banners")
-def list_banners(screen: str = None):
-    query = {"screen": screen} if screen else {}
-    docs  = list(col_banners.find(query).sort("created_at", DESCENDING))
+
+@app.get("/gym/{gym_id}/banners")
+def list_banners(gym_id: str, screen: str = None):
+    """
+    ✅ SECURE: Only return banners for this specific gym
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    
+    query = {"gym_id": gym_id}
+    if screen:
+        query["screen"] = screen
+    
+    docs = list(col_banners.find(query).sort("created_at", DESCENDING))
     return [_doc(d) for d in docs]
 
-@app.delete("/banners/{banner_id}")
-def delete_banner(banner_id: str):
-    result = col_banners.delete_one({"banner_id": banner_id})
+
+@app.delete("/gym/{gym_id}/banners/{banner_id}")
+def delete_banner(gym_id: str, banner_id: str):
+    """
+    ✅ SECURE: Only delete banners that belong to this gym
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    
+    result = col_banners.delete_one({"banner_id": banner_id, "gym_id": gym_id})
     if result.deleted_count == 0:
-        raise HTTPException(404, "Banner not found")
+        raise HTTPException(404, "Banner not found or belongs to a different gym")
+    print(f"✅  Banner deleted → {banner_id} from gym {gym_id}", flush=True)
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — NOTIFICATIONS
+#  ROUTES — NOTIFICATIONS (✅ SECURED WITH GYM ISOLATION)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/notifications")
-def create_notification(req: NotificationCreate):
+# ✅ SECURE: gym_id in URL path, stored in document, filtered on queries
+@app.post("/gym/{gym_id}/notifications")
+def create_notification(gym_id: str, req: NotificationCreate):
+    """
+    ✅ SECURE: gym_id is in the URL path, not just a body parameter
+    Only this gym can create notifications for itself
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    
+    if req.gym_id != gym_id:
+        raise HTTPException(403, "Cannot create notifications for a different gym")
+
     notif_id = str(uuid.uuid4())
     col_notifs.insert_one({
         "notification_id": notif_id,
+        "gym_id":          gym_id,        # ✅ STORE gym_id
         "title":           req.title,
         "body":            req.body,
         "type":            req.type,
@@ -798,18 +818,38 @@ def create_notification(req: NotificationCreate):
         "scheduled_at":    req.scheduled_at or "",
         "sent_at":         datetime.now(timezone.utc),
     })
+    print(f"✅  Notification created → {notif_id} for gym {gym_id}", flush=True)
     return {"status": "sent", "notification_id": notif_id}
 
-@app.get("/notifications")
-def list_notifications():
-    docs = list(col_notifs.find().sort("sent_at", DESCENDING).limit(50))
+
+@app.get("/gym/{gym_id}/notifications")
+def list_notifications(gym_id: str):
+    """
+    ✅ SECURE: Only return notifications for this specific gym
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    
+    docs = list(
+        col_notifs.find({"gym_id": gym_id})
+        .sort("sent_at", DESCENDING)
+        .limit(50)
+    )
     return [_doc(d) for d in docs]
 
-@app.delete("/notifications/{notification_id}")
-def delete_notification(notification_id: str):
-    result = col_notifs.delete_one({"notification_id": notification_id})
+
+@app.delete("/gym/{gym_id}/notifications/{notification_id}")
+def delete_notification(gym_id: str, notification_id: str):
+    """
+    ✅ SECURE: Only delete notifications that belong to this gym
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    
+    result = col_notifs.delete_one({"notification_id": notification_id, "gym_id": gym_id})
     if result.deleted_count == 0:
-        raise HTTPException(404, "Notification not found")
+        raise HTTPException(404, "Notification not found or belongs to a different gym")
+    print(f"✅  Notification deleted → {notification_id} from gym {gym_id}", flush=True)
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
