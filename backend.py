@@ -14,7 +14,7 @@ except ImportError:
     pass
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONFIG  — all secrets come from environment variables, nothing hardcoded
+#  CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _require(key: str) -> str:
@@ -31,9 +31,12 @@ CLOUDINARY_API_KEY = _require("CLOUDINARY_API_KEY")
 CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
 SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
 
-# ── Alpha / Super admin (platform owner) ──────────────────────────────────────
 ALPHA_USERNAME = os.environ.get("ALPHA_USERNAME", "superadmin").strip()
 ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
+
+# ── Revenue split constants ───────────────────────────────────────────────────
+PLATFORM_SHARE_PCT = 40   # % that goes to Aerofit platform
+GYM_SHARE_PCT      = 60   # % that stays with gym admin
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONGODB INIT
@@ -55,14 +58,15 @@ col_scan_limits: Collection = mdb["scan_limits"]
 col_gyms:        Collection = mdb["platform_gyms"]
 col_gym_admins:  Collection = mdb["platform_gym_admins"]
 col_user_ids:    Collection = mdb["gym_user_ids"]
+col_invoices:    Collection = mdb["invoices"]          # ✅ NEW: billing invoices
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
 col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
 col_banners.create_index("created_at")
-col_banners.create_index([("gym_id", 1), ("created_at", DESCENDING)])  # ✅ NEW
+col_banners.create_index([("gym_id", 1), ("created_at", DESCENDING)])
 col_notifs.create_index("sent_at")
-col_notifs.create_index([("gym_id", 1), ("sent_at", DESCENDING)])  # ✅ NEW
+col_notifs.create_index([("gym_id", 1), ("sent_at", DESCENDING)])
 col_scan_limits.create_index([("email", 1), ("date", 1)], unique=True)
 col_gyms.create_index("gym_id", unique=True)
 col_gyms.create_index("admin_email")
@@ -71,6 +75,9 @@ col_gym_admins.create_index("email", unique=True)
 col_gym_admins.create_index("gym_id")
 col_user_ids.create_index([("gym_id", 1), ("code", 1)], unique=True)
 col_user_ids.create_index("code")
+col_invoices.create_index([("gym_id", 1), ("created_at", DESCENDING)])   # ✅ NEW
+col_invoices.create_index("invoice_id", unique=True)                      # ✅ NEW
+col_invoices.create_index("status")                                       # ✅ NEW
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -122,7 +129,7 @@ threading.Thread(target=_keep_alive, daemon=True).start()
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="11.0.0")
+app = FastAPI(title="AERO-FIT API", version="12.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -242,6 +249,32 @@ def _generate_code() -> str:
     return "AF-" + "".join(__import__("random").choice(chars) for _ in range(4))
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  BILLING HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _calc_invoice_splits(price_per_user: float, member_count: int) -> dict:
+    """
+    Calculate gross, platform share (40%), and gym share (60%).
+    Returns a dict with all monetary values in INR (paise-free float).
+    """
+    gross             = round(price_per_user * member_count, 2)
+    platform_amount   = round(gross * PLATFORM_SHARE_PCT / 100, 2)
+    gym_amount        = round(gross * GYM_SHARE_PCT / 100, 2)
+    return {
+        "gross":            gross,
+        "platform_amount":  platform_amount,   # 40% → Aerofit
+        "gym_amount":       gym_amount,         # 60% → Gym admin
+        "platform_pct":     PLATFORM_SHARE_PCT,
+        "gym_pct":          GYM_SHARE_PCT,
+    }
+
+def _invoice_number() -> str:
+    """AF-INV-YYYYMM-XXXX"""
+    now = datetime.now(timezone.utc)
+    suffix = str(uuid.uuid4())[:4].upper()
+    return f"AF-INV-{now.strftime('%Y%m')}-{suffix}"
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  PYDANTIC MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -286,7 +319,6 @@ class LogMealRequest(BaseModel):
     serving_size: str
     image_base64: Optional[str] = ""
 
-# ✅ FIXED: Added gym_id field
 class BannerCreate(BaseModel):
     title:        str
     screen:       str           = "home"
@@ -294,9 +326,8 @@ class BannerCreate(BaseModel):
     expires_at:   Optional[str] = None
     deep_link:    Optional[str] = None
     image_base64: Optional[str] = None
-    gym_id:       str           # ✅ REQUIRED: which gym owns this banner
+    gym_id:       str
 
-# ✅ FIXED: Added gym_id field
 class NotificationCreate(BaseModel):
     title:        str
     body:         str
@@ -304,23 +335,25 @@ class NotificationCreate(BaseModel):
     segments:     list[str] = ["all"]
     deep_link:    Optional[str] = None
     scheduled_at: Optional[str] = None
-    gym_id:       str           # ✅ REQUIRED: which gym owns this notification
+    gym_id:       str
 
 class GymCreate(BaseModel):
-    name:           str
-    city:           str
-    plan:           str = "Starter"
-    admin_email:    str
-    admin_name:     str = "Admin"
-    admin_password: str = ""
+    name:            str
+    city:            str
+    plan:            str   = "Starter"
+    admin_email:     str
+    admin_name:      str   = "Admin"
+    admin_password:  str   = ""
+    price_per_user:  float = 0.0   # ✅ NEW: INR per active user per month
 
 class GymUpdate(BaseModel):
-    name:    Optional[str] = None
-    city:    Optional[str] = None
-    plan:    Optional[str] = None
-    status:  Optional[str] = None
-    members: Optional[int] = None
-    revenue: Optional[int] = None
+    name:            Optional[str]   = None
+    city:            Optional[str]   = None
+    plan:            Optional[str]   = None
+    status:          Optional[str]   = None
+    members:         Optional[int]   = None
+    revenue:         Optional[int]   = None
+    price_per_user:  Optional[float] = None   # ✅ NEW
 
 class GymAdminUpdate(BaseModel):
     name:   Optional[str] = None
@@ -333,13 +366,30 @@ class ValidateUserIdRequest(BaseModel):
 class GenerateUserIdsRequest(BaseModel):
     count: int = 1
 
+# ✅ NEW: Invoice models
+class InvoiceCreate(BaseModel):
+    gym_id:      str
+    period:      str              # e.g. "June 2025"
+    member_count: int
+    notes:       Optional[str] = ""
+
+class InvoiceStatusUpdate(BaseModel):
+    status:       str             # pending | paid | overdue | cancelled
+    paid_at:      Optional[str] = None
+    payment_ref:  Optional[str] = None   # UPI ref / bank ref
+
+class InvoiceAlert(BaseModel):
+    gym_id:   str
+    message:  str
+    alert_type: str = "payment_reminder"   # payment_reminder | overdue | receipt
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "11.0.0", "db": "mongodb", "ai": GEMINI_MDL_PRIMARY}
+    return {"status": "ok", "version": "12.0.0", "db": "mongodb", "ai": GEMINI_MDL_PRIMARY}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — ALPHA ADMIN AUTH
@@ -382,13 +432,25 @@ def gym_admin_login(req: AdminLogin):
 @app.get("/alpha/stats")
 def platform_stats():
     gyms = list(col_gyms.find())
+    # ✅ NEW: real revenue from paid invoices
+    paid_invoices = list(col_invoices.find({"status": "paid"}))
+    platform_earned = sum(inv.get("platform_amount", 0) for inv in paid_invoices)
+    pending_invoices = list(col_invoices.find({"status": {"$in": ["pending", "overdue"]}}))
+    pending_amount   = sum(inv.get("gross", 0) for inv in pending_invoices)
+
     return {
-        "total_gyms":    len(gyms),
-        "active_gyms":   sum(1 for g in gyms if g.get("status") == "active"),
-        "trial_gyms":    sum(1 for g in gyms if g.get("status") == "trial"),
-        "pro_gyms":      sum(1 for g in gyms if g.get("plan") == "Pro"),
-        "total_members": sum(g.get("members", 0) for g in gyms),
-        "total_revenue": sum(g.get("revenue", 0) for g in gyms),
+        "total_gyms":        len(gyms),
+        "active_gyms":       sum(1 for g in gyms if g.get("status") == "active"),
+        "trial_gyms":        sum(1 for g in gyms if g.get("status") == "trial"),
+        "pro_gyms":          sum(1 for g in gyms if g.get("plan") == "Pro"),
+        "total_members":     sum(g.get("members", 0) for g in gyms),
+        "total_revenue":     sum(g.get("revenue", 0) for g in gyms),
+        # ✅ NEW billing stats
+        "platform_earned":   platform_earned,
+        "pending_amount":    pending_amount,
+        "paid_invoices":     len(paid_invoices),
+        "pending_invoices":  len(pending_invoices),
+        "overdue_invoices":  sum(1 for inv in pending_invoices if inv.get("status") == "overdue"),
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -412,16 +474,17 @@ def create_gym(req: GymCreate):
     now      = datetime.now(timezone.utc)
 
     col_gyms.insert_one({
-        "gym_id":      gym_id,
-        "name":        req.name.strip(),
-        "city":        req.city.strip(),
-        "plan":        req.plan,
-        "status":      "trial" if req.plan == "Trial" else "active",
-        "members":     0,
-        "revenue":     0,
-        "admin_email": admin_email,
-        "admin_id":    admin_id,
-        "created_at":  now,
+        "gym_id":           gym_id,
+        "name":             req.name.strip(),
+        "city":             req.city.strip(),
+        "plan":             req.plan,
+        "status":           "trial" if req.plan == "Trial" else "active",
+        "members":          0,
+        "revenue":          0,
+        "price_per_user":   req.price_per_user,   # ✅ NEW
+        "admin_email":      admin_email,
+        "admin_id":         admin_id,
+        "created_at":       now,
     })
 
     hashed = bcrypt.hashpw(raw_pw.encode(), bcrypt.gensalt()).decode()
@@ -436,13 +499,14 @@ def create_gym(req: GymCreate):
         "created_at": now,
     })
 
-    print(f"✅  Gym created → {gym_id}  admin → {admin_email}", flush=True)
+    print(f"✅  Gym created → {gym_id}  admin → {admin_email}  price_per_user → ₹{req.price_per_user}", flush=True)
     return {
-        "status":          "created",
-        "gym_id":          gym_id,
-        "admin_id":        admin_id,
-        "admin_email":     admin_email,
-        "admin_password":  raw_pw,
+        "status":           "created",
+        "gym_id":           gym_id,
+        "admin_id":         admin_id,
+        "admin_email":      admin_email,
+        "admin_password":   raw_pw,
+        "price_per_user":   req.price_per_user,
     }
 
 @app.get("/alpha/gyms/{gym_id}")
@@ -463,12 +527,13 @@ def update_gym(gym_id: str, req: GymUpdate):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
     update: dict = {"updated_at": datetime.now(timezone.utc)}
-    if req.name    is not None: update["name"]    = req.name
-    if req.city    is not None: update["city"]    = req.city
-    if req.plan    is not None: update["plan"]    = req.plan
-    if req.status  is not None: update["status"]  = req.status
-    if req.members is not None: update["members"] = req.members
-    if req.revenue is not None: update["revenue"] = req.revenue
+    if req.name           is not None: update["name"]           = req.name
+    if req.city           is not None: update["city"]           = req.city
+    if req.plan           is not None: update["plan"]           = req.plan
+    if req.status         is not None: update["status"]         = req.status
+    if req.members        is not None: update["members"]        = req.members
+    if req.revenue        is not None: update["revenue"]        = req.revenue
+    if req.price_per_user is not None: update["price_per_user"] = req.price_per_user   # ✅ NEW
     col_gyms.update_one({"gym_id": gym_id}, {"$set": update})
     return {"status": "updated", "gym_id": gym_id}
 
@@ -538,18 +603,216 @@ def delete_gym_admin(admin_id: str):
     return {"status": "deleted", "admin_id": admin_id}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — USER IDs  (gym admin generates, Flutter app validates & consumes)
+#  ROUTES — INVOICES  (super admin creates, gym admin views)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/alpha/invoices")
+def create_invoice(req: InvoiceCreate):
+    """
+    Super admin generates an invoice for a gym.
+    Calculates gross = price_per_user × member_count
+    Then splits: 40% platform, 60% gym admin.
+    """
+    gym = col_gyms.find_one({"gym_id": req.gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    price_per_user = gym.get("price_per_user", 0.0)
+    if price_per_user <= 0:
+        raise HTTPException(400, "This gym has no price_per_user set. Update the gym first.")
+
+    splits     = _calc_invoice_splits(price_per_user, req.member_count)
+    invoice_id = str(uuid.uuid4())
+    inv_number = _invoice_number()
+    now        = datetime.now(timezone.utc)
+
+    col_invoices.insert_one({
+        "invoice_id":       invoice_id,
+        "invoice_number":   inv_number,
+        "gym_id":           req.gym_id,
+        "gym_name":         gym["name"],
+        "admin_email":      gym.get("admin_email", ""),
+        "period":           req.period,
+        "member_count":     req.member_count,
+        "price_per_user":   price_per_user,
+        "gross":            splits["gross"],
+        "platform_amount":  splits["platform_amount"],
+        "gym_amount":       splits["gym_amount"],
+        "platform_pct":     PLATFORM_SHARE_PCT,
+        "gym_pct":          GYM_SHARE_PCT,
+        "status":           "pending",          # pending | paid | overdue | cancelled
+        "notes":            req.notes or "",
+        "created_at":       now,
+        "due_at":           now + timedelta(days=15),
+        "paid_at":          None,
+        "payment_ref":      None,
+        "alerts":           [],
+    })
+
+    print(f"✅  Invoice {inv_number} created for {gym['name']} → ₹{splits['gross']}", flush=True)
+    return {
+        "status":           "created",
+        "invoice_id":       invoice_id,
+        "invoice_number":   inv_number,
+        **splits,
+        "due_at":           (now + timedelta(days=15)).isoformat(),
+    }
+
+
+@app.get("/alpha/invoices")
+def list_all_invoices(status: str = None):
+    """Super admin: list all invoices, optionally filtered by status."""
+    query = {}
+    if status:
+        query["status"] = status
+    docs = list(col_invoices.find(query).sort("created_at", DESCENDING))
+    return [_doc(d) for d in docs]
+
+
+@app.get("/alpha/invoices/{invoice_id}")
+def get_invoice(invoice_id: str):
+    inv = col_invoices.find_one({"invoice_id": invoice_id})
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    return _doc(inv)
+
+
+@app.patch("/alpha/invoices/{invoice_id}/status")
+def update_invoice_status(invoice_id: str, req: InvoiceStatusUpdate):
+    """Super admin marks an invoice as paid / overdue / cancelled."""
+    inv = col_invoices.find_one({"invoice_id": invoice_id})
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+
+    update: dict = {
+        "status":     req.status,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if req.paid_at:     update["paid_at"]     = req.paid_at
+    if req.payment_ref: update["payment_ref"] = req.payment_ref
+
+    # If marking paid, also update gym revenue
+    if req.status == "paid":
+        col_gyms.update_one(
+            {"gym_id": inv["gym_id"]},
+            {"$inc": {"revenue": inv.get("gym_amount", 0)}}
+        )
+
+    col_invoices.update_one({"invoice_id": invoice_id}, {"$set": update})
+    print(f"✅  Invoice {inv['invoice_number']} → {req.status}", flush=True)
+    return {"status": "updated", "invoice_id": invoice_id, "new_status": req.status}
+
+
+@app.delete("/alpha/invoices/{invoice_id}")
+def delete_invoice(invoice_id: str):
+    result = col_invoices.delete_one({"invoice_id": invoice_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Invoice not found")
+    return {"status": "deleted"}
+
+
+@app.post("/alpha/invoices/{invoice_id}/alert")
+def send_invoice_alert(invoice_id: str, req: InvoiceAlert):
+    """
+    Super admin sends a payment alert / reminder to a gym.
+    Stored in the invoice's alerts array AND as a gym notification.
+    """
+    inv = col_invoices.find_one({"invoice_id": invoice_id})
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+
+    now       = datetime.now(timezone.utc)
+    alert_doc = {
+        "alert_id":   str(uuid.uuid4()),
+        "type":       req.alert_type,
+        "message":    req.message,
+        "sent_at":    now,
+    }
+
+    # Append to invoice alerts log
+    col_invoices.update_one(
+        {"invoice_id": invoice_id},
+        {"$push": {"alerts": alert_doc}}
+    )
+
+    # Also push as a gym notification so gym admin sees it in their dashboard
+    col_notifs.insert_one({
+        "notification_id": str(uuid.uuid4()),
+        "gym_id":          inv["gym_id"],
+        "title":           _alert_title(req.alert_type, inv["invoice_number"]),
+        "body":            req.message,
+        "type":            "billing",
+        "segments":        ["admin"],
+        "deep_link":       f"aerofit://billing/invoice/{invoice_id}",
+        "scheduled_at":    "",
+        "sent_at":         now,
+        "invoice_id":      invoice_id,
+    })
+
+    print(f"✅  Alert sent for invoice {inv['invoice_number']} → {req.alert_type}", flush=True)
+    return {"status": "sent", "alert_id": alert_doc["alert_id"]}
+
+
+def _alert_title(alert_type: str, inv_number: str) -> str:
+    MAP = {
+        "payment_reminder": f"💳 Payment Due — {inv_number}",
+        "overdue":          f"🚨 Overdue Invoice — {inv_number}",
+        "receipt":          f"✅ Payment Received — {inv_number}",
+    }
+    return MAP.get(alert_type, f"📋 Invoice Alert — {inv_number}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — INVOICES (gym admin view — read-only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/gym/{gym_id}/invoices")
+def list_gym_invoices(gym_id: str):
+    """Gym admin: see all their own invoices."""
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    docs = list(col_invoices.find({"gym_id": gym_id}).sort("created_at", DESCENDING))
+    return [_doc(d) for d in docs]
+
+
+@app.get("/gym/{gym_id}/billing-summary")
+def gym_billing_summary(gym_id: str):
+    """Gym admin: quick billing stats."""
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    invoices = list(col_invoices.find({"gym_id": gym_id}))
+    paid     = [i for i in invoices if i.get("status") == "paid"]
+    pending  = [i for i in invoices if i.get("status") == "pending"]
+    overdue  = [i for i in invoices if i.get("status") == "overdue"]
+
+    return {
+        "price_per_user":      gym.get("price_per_user", 0),
+        "platform_pct":        PLATFORM_SHARE_PCT,
+        "gym_pct":             GYM_SHARE_PCT,
+        "total_invoices":      len(invoices),
+        "total_paid":          sum(i.get("gross", 0) for i in paid),
+        "total_pending":       sum(i.get("gross", 0) for i in pending),
+        "total_overdue":       sum(i.get("gross", 0) for i in overdue),
+        "gym_earnings":        sum(i.get("gym_amount", 0) for i in paid),
+        "platform_earnings":   sum(i.get("platform_amount", 0) for i in paid),
+        "paid_count":          len(paid),
+        "pending_count":       len(pending),
+        "overdue_count":       len(overdue),
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — USER IDs
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/gym/{gym_id}/user-ids/generate")
 def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-
     count = max(1, min(req.count, 50))
     codes = []
     now   = datetime.now(timezone.utc)
-
     for _ in range(count):
         for _attempt in range(10):
             code = _generate_code()
@@ -564,7 +827,6 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
             "used_by":    None,
         })
         codes.append(code)
-
     print(f"✅  Generated {count} User ID(s) for {gym_id}", flush=True)
     return {"status": "created", "gym_id": gym_id, "codes": codes}
 
@@ -607,7 +869,6 @@ def add_user(req: AddUserRequest):
         raise HTTPException(400, "Invalid email address")
     if col_users.find_one({"email": email}):
         raise HTTPException(409, "User already exists")
-
     if req.gym_id and req.user_id:
         gym_id = req.gym_id.strip()
         code   = req.user_id.strip().upper()
@@ -618,14 +879,9 @@ def add_user(req: AddUserRequest):
             raise HTTPException(400, "This User ID has already been used")
         col_user_ids.update_one(
             {"gym_id": gym_id, "code": code, "status": "active"},
-            {"$set": {
-                "status":  "used",
-                "used_at": datetime.now(timezone.utc),
-                "used_by": email,
-            }},
+            {"$set": {"status": "used", "used_at": datetime.now(timezone.utc), "used_by": email}},
         )
         col_gyms.update_one({"gym_id": gym_id}, {"$inc": {"members": 1}})
-
     hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
     col_users.insert_one({
         "email":      email,
@@ -672,13 +928,11 @@ def user_login(req: UserLogin):
         raise HTTPException(401, "Invalid email or password")
     if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
         raise HTTPException(401, "Invalid email or password")
-    
     gym_name = ""
     if user.get("gym_id"):
         gym = col_gyms.find_one({"gym_id": user["gym_id"]})
         if gym:
             gym_name = gym.get("name", "")
-    
     return {
         "status": "ok",
         "user": {
@@ -696,13 +950,11 @@ def get_user(email: str):
     user = col_users.find_one({"email": email.lower()})
     if not user:
         raise HTTPException(404, "User not found")
-    
     gym_name = ""
     if user.get("gym_id"):
         gym = col_gyms.find_one({"gym_id": user["gym_id"]})
         if gym:
             gym_name = gym.get("name", "")
-    
     return {
         "email":     user["email"],
         "name":      user["name"],
@@ -725,27 +977,20 @@ def update_user(email: str, req: UserUpdate):
     return {"status": "updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — BANNERS (✅ SECURED WITH GYM ISOLATION)
+#  ROUTES — BANNERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ✅ SECURE: gym_id in URL path, stored in document, filtered on queries
 @app.post("/gym/{gym_id}/banners")
 def create_banner(gym_id: str, req: BannerCreate):
-    """
-    ✅ SECURE: gym_id is in the URL path, not just a body parameter
-    Only this gym can create banners for itself
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-    
     if req.gym_id != gym_id:
         raise HTTPException(403, "Cannot create banners for a different gym")
-
     banner_id = str(uuid.uuid4())
     image_url = upload_image(req.image_base64 or "", folder="aerofitdb/banners", public_id=banner_id)
     doc = {
         "banner_id":  banner_id,
-        "gym_id":     gym_id,        # ✅ STORE gym_id
+        "gym_id":     gym_id,
         "title":      req.title,
         "screen":     req.screen,
         "status":     req.status,
@@ -755,61 +1000,41 @@ def create_banner(gym_id: str, req: BannerCreate):
         "created_at": datetime.now(timezone.utc),
     }
     col_banners.insert_one(doc)
-    print(f"✅  Banner created → {banner_id} for gym {gym_id}", flush=True)
     return {"status": "created", "banner_id": banner_id, "image_url": image_url}
-
 
 @app.get("/gym/{gym_id}/banners")
 def list_banners(gym_id: str, screen: str = None):
-    """
-    ✅ SECURE: Only return banners for this specific gym
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-    
     query = {"gym_id": gym_id}
     if screen:
         query["screen"] = screen
-    
     docs = list(col_banners.find(query).sort("created_at", DESCENDING))
     return [_doc(d) for d in docs]
 
-
 @app.delete("/gym/{gym_id}/banners/{banner_id}")
 def delete_banner(gym_id: str, banner_id: str):
-    """
-    ✅ SECURE: Only delete banners that belong to this gym
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-    
     result = col_banners.delete_one({"banner_id": banner_id, "gym_id": gym_id})
     if result.deleted_count == 0:
         raise HTTPException(404, "Banner not found or belongs to a different gym")
-    print(f"✅  Banner deleted → {banner_id} from gym {gym_id}", flush=True)
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — NOTIFICATIONS (✅ SECURED WITH GYM ISOLATION)
+#  ROUTES — NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ✅ SECURE: gym_id in URL path, stored in document, filtered on queries
 @app.post("/gym/{gym_id}/notifications")
 def create_notification(gym_id: str, req: NotificationCreate):
-    """
-    ✅ SECURE: gym_id is in the URL path, not just a body parameter
-    Only this gym can create notifications for itself
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-    
     if req.gym_id != gym_id:
         raise HTTPException(403, "Cannot create notifications for a different gym")
-
     notif_id = str(uuid.uuid4())
     col_notifs.insert_one({
         "notification_id": notif_id,
-        "gym_id":          gym_id,        # ✅ STORE gym_id
+        "gym_id":          gym_id,
         "title":           req.title,
         "body":            req.body,
         "type":            req.type,
@@ -818,38 +1043,22 @@ def create_notification(gym_id: str, req: NotificationCreate):
         "scheduled_at":    req.scheduled_at or "",
         "sent_at":         datetime.now(timezone.utc),
     })
-    print(f"✅  Notification created → {notif_id} for gym {gym_id}", flush=True)
     return {"status": "sent", "notification_id": notif_id}
-
 
 @app.get("/gym/{gym_id}/notifications")
 def list_notifications(gym_id: str):
-    """
-    ✅ SECURE: Only return notifications for this specific gym
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-    
-    docs = list(
-        col_notifs.find({"gym_id": gym_id})
-        .sort("sent_at", DESCENDING)
-        .limit(50)
-    )
+    docs = list(col_notifs.find({"gym_id": gym_id}).sort("sent_at", DESCENDING).limit(50))
     return [_doc(d) for d in docs]
-
 
 @app.delete("/gym/{gym_id}/notifications/{notification_id}")
 def delete_notification(gym_id: str, notification_id: str):
-    """
-    ✅ SECURE: Only delete notifications that belong to this gym
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-    
     result = col_notifs.delete_one({"notification_id": notification_id, "gym_id": gym_id})
     if result.deleted_count == 0:
         raise HTTPException(404, "Notification not found or belongs to a different gym")
-    print(f"✅  Notification deleted → {notification_id} from gym {gym_id}", flush=True)
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
