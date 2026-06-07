@@ -609,9 +609,8 @@ def delete_gym_admin(admin_id: str):
 @app.post("/alpha/invoices")
 def create_invoice(req: InvoiceCreate):
     """
-    Super admin generates an invoice for a gym.
-    Calculates gross = price_per_user × member_count
-    Then splits: 40% platform, 60% gym admin.
+    Super admin generates invoice.
+    ✅ MEMBER COUNT IS AUTO-CALCULATED from used User IDs (not manual input)
     """
     gym = col_gyms.find_one({"gym_id": req.gym_id})
     if not gym:
@@ -621,7 +620,14 @@ def create_invoice(req: InvoiceCreate):
     if price_per_user <= 0:
         raise HTTPException(400, "This gym has no price_per_user set. Update the gym first.")
 
-    splits     = _calc_invoice_splits(price_per_user, req.member_count)
+    # ✅ NEW: Count used User IDs for this gym
+    used_ids = list(col_user_ids.find({"gym_id": req.gym_id, "status": "used"}))
+    member_count = len(used_ids)
+    
+    if member_count == 0:
+        raise HTTPException(400, "This gym has no active members yet (no used User IDs)")
+
+    splits     = _calc_invoice_splits(price_per_user, member_count)
     invoice_id = str(uuid.uuid4())
     inv_number = _invoice_number()
     now        = datetime.now(timezone.utc)
@@ -633,14 +639,14 @@ def create_invoice(req: InvoiceCreate):
         "gym_name":         gym["name"],
         "admin_email":      gym.get("admin_email", ""),
         "period":           req.period,
-        "member_count":     req.member_count,
+        "member_count":     member_count,  # ✅ AUTO from used User IDs
         "price_per_user":   price_per_user,
         "gross":            splits["gross"],
         "platform_amount":  splits["platform_amount"],
         "gym_amount":       splits["gym_amount"],
         "platform_pct":     PLATFORM_SHARE_PCT,
         "gym_pct":          GYM_SHARE_PCT,
-        "status":           "pending",          # pending | paid | overdue | cancelled
+        "status":           "pending",
         "notes":            req.notes or "",
         "created_at":       now,
         "due_at":           now + timedelta(days=15),
@@ -649,11 +655,12 @@ def create_invoice(req: InvoiceCreate):
         "alerts":           [],
     })
 
-    print(f"✅  Invoice {inv_number} created for {gym['name']} → ₹{splits['gross']}", flush=True)
+    print(f"✅  Invoice {inv_number} created for {gym['name']} ({member_count} members) → ₹{splits['gross']}", flush=True)
     return {
         "status":           "created",
         "invoice_id":       invoice_id,
         "invoice_number":   inv_number,
+        "member_count":     member_count,  # ✅ Return auto-calculated count
         **splits,
         "due_at":           (now + timedelta(days=15)).isoformat(),
     }
