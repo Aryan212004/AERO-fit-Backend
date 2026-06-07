@@ -379,6 +379,9 @@ class InvoiceAlert(BaseModel):
     message:    str
     alert_type: str = "payment_reminder"
 
+class UpdateUserIdPlan(BaseModel):
+    plan_months: int  # 1–12
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -847,6 +850,24 @@ def revoke_user_id(gym_id: str, code: str):
     if result.deleted_count == 0:
         raise HTTPException(404, "Active code not found")
     return {"status": "revoked", "code": code}
+
+
+@app.patch("/gym/{gym_id}/user-ids/{code}/plan")
+def update_user_id_plan(gym_id: str, code: str, req: UpdateUserIdPlan):
+    code = code.strip().upper()
+    doc  = col_user_ids.find_one({"gym_id": gym_id, "code": code})
+    if not doc:
+        raise HTTPException(404, "User ID not found")
+    if doc.get("status") != "active":
+        raise HTTPException(400, "Cannot change plan on a used User ID")
+    plan_months = max(1, min(req.plan_months, 12))
+    plan_label  = f"{plan_months} Month{'s' if plan_months > 1 else ''}"
+    col_user_ids.update_one(
+        {"gym_id": gym_id, "code": code},
+        {"$set": {"plan_months": plan_months, "plan_label": plan_label}}
+    )
+    print(f"✅  Plan updated → {code}  {plan_label}", flush=True)
+    return {"status": "updated", "code": code, "plan_months": plan_months, "plan_label": plan_label}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — USER MANAGEMENT
