@@ -58,7 +58,8 @@ col_scan_limits: Collection = mdb["scan_limits"]
 col_gyms:        Collection = mdb["platform_gyms"]
 col_gym_admins:  Collection = mdb["platform_gym_admins"]
 col_user_ids:    Collection = mdb["gym_user_ids"]
-col_invoices:    Collection = mdb["invoices"]          # ✅ NEW: billing invoices
+col_invoices:    Collection = mdb["invoices"]         
+col_plans: Collection = mdb["gym_plans"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
@@ -70,6 +71,8 @@ col_notifs.create_index([("gym_id", 1), ("sent_at", DESCENDING)])
 col_scan_limits.create_index([("email", 1), ("date", 1)], unique=True)
 col_gyms.create_index("gym_id", unique=True)
 col_gyms.create_index("admin_email")
+col_plans.create_index([("gym_id", 1), ("name", 1)], unique=True)
+col_plans.create_index([("gym_id", 1), ("created_at", DESCENDING)])
 col_gym_admins.create_index("admin_id", unique=True)
 col_gym_admins.create_index("email", unique=True)
 col_gym_admins.create_index("gym_id")
@@ -382,6 +385,21 @@ class InvoiceAlert(BaseModel):
     gym_id:   str
     message:  str
     alert_type: str = "payment_reminder"   # payment_reminder | overdue | receipt
+
+class PlanCreate(BaseModel):
+    name:         str           # "Gold 3-Month"
+    duration_days: int          # 30, 90, 180, 365
+    price_inr:    float         # ₹499, ₹999 etc
+    description:  Optional[str] = None
+    features:     Optional[list[str]] = None  # ["Unlimited classes", "Personal trainer"]
+    gym_id:       str
+
+class PlanUpdate(BaseModel):
+    name:         Optional[str] = None
+    duration_days: Optional[int] = None
+    price_inr:    Optional[float] = None
+    description:  Optional[str] = None
+    features:     Optional[list[str]] = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -826,13 +844,16 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
             if not col_user_ids.find_one({"code": code}):
                 break
         col_user_ids.insert_one({
-            "gym_id":     gym_id,
-            "code":       code,
-            "status":     "active",
-            "created_at": now,
-            "used_at":    None,
-            "used_by":    None,
-        })
+    "gym_id":     gym_id,
+    "code":       code,
+    "status":     "active",
+    "plan_id":    None,         # ✅ NEW
+    "plan_name":  None,         # ✅ NEW
+    "created_at": now,
+    "used_at":    None,
+    "used_by":    None,
+    "expires_at": None,         # ✅ NEW: expiry date after plan duration
+})
         codes.append(code)
     print(f"✅  Generated {count} User ID(s) for {gym_id}", flush=True)
     return {"status": "created", "gym_id": gym_id, "codes": codes}
@@ -1157,6 +1178,94 @@ def delete_meal(meal_id: str):
     if result.deleted_count == 0:
         raise HTTPException(404, "Meal not found")
     return {"status": "deleted"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — MEMBERSHIP PLANS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/gym/{gym_id}/plans")
+def create_plan(gym_id: str, req: PlanCreate):
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    if req.gym_id != gym_id:
+        raise HTTPException(403, "Cannot create plans for a different gym")
+    
+    plan_id = "plan_" + str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc)
+    
+    try:
+        col_plans.insert_one({
+            "plan_id":       plan_id,
+            "gym_id":        gym_id,
+            "name":          req.name.strip(),
+            "duration_days": req.duration_days,
+            "price_inr":     req.price_inr,
+            "description":   req.description or "",
+            "features":      req.features or [],
+            "status":        "active",
+            "created_at":    now,
+        })
+    except Exception as e:
+        if "duplicate" in str(e).lower():
+            raise HTTPException(409, f"Plan '{req.name}' already exists for this gym")
+        raise
+    
+    print(f"✅  Plan created → {plan_id}  {req.name}  {req.duration_days}d  ₹{req.price_inr}", flush=True)
+    return {
+        "status":        "created",
+        "plan_id":       plan_id,
+        "name":          req.name,
+        "duration_days": req.duration_days,
+        "price_inr":     req.price_inr,
+    }
+
+
+@app.get("/gym/{gym_id}/plans")
+def list_plans(gym_id: str):
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    docs = list(col_plans.find({"gym_id": gym_id}).sort("duration_days", 1))
+    return [_doc(d) for d in docs]
+
+
+@app.get("/gym/{gym_id}/plans/{plan_id}")
+def get_plan(gym_id: str, plan_id: str):
+    plan = col_plans.find_one({"plan_id": plan_id, "gym_id": gym_id})
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    return _doc(plan)
+
+
+@app.patch("/gym/{gym_id}/plans/{plan_id}")
+def update_plan(gym_id: str, plan_id: str, req: PlanUpdate):
+    plan = col_plans.find_one({"plan_id": plan_id, "gym_id": gym_id})
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    
+    update: dict = {"updated_at": datetime.now(timezone.utc)}
+    if req.name         is not None: update["name"]          = req.name
+    if req.duration_days is not None: update["duration_days"] = req.duration_days
+    if req.price_inr    is not None: update["price_inr"]     = req.price_inr
+    if req.description  is not None: update["description"]    = req.description
+    if req.features     is not None: update["features"]       = req.features
+    
+    col_plans.update_one({"plan_id": plan_id}, {"$set": update})
+    return {"status": "updated", "plan_id": plan_id}
+
+
+@app.delete("/gym/{gym_id}/plans/{plan_id}")
+def delete_plan(gym_id: str, plan_id: str):
+    plan = col_plans.find_one({"plan_id": plan_id, "gym_id": gym_id})
+    if not plan:
+        raise HTTPException(404, "Plan not found")
+    
+    # Prevent deletion if plan is in use
+    active_users = col_user_ids.find_one({"gym_id": gym_id, "plan_id": plan_id, "status": "used"})
+    if active_users:
+        raise HTTPException(400, "Cannot delete plan with active members. Deactivate instead.")
+    
+    col_plans.delete_one({"plan_id": plan_id})
+    return {"status": "deleted", "plan_id": plan_id}
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
