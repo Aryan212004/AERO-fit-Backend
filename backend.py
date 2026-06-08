@@ -75,6 +75,7 @@ col_gym_admins.create_index("email", unique=True)
 col_gym_admins.create_index("gym_id")
 col_user_ids.create_index([("gym_id", 1), ("code", 1)], unique=True)
 col_user_ids.create_index("code")
+col_user_ids.create_index([("status", 1), ("expires_at", 1)])   # ✅ expiry job index
 col_invoices.create_index([("gym_id", 1), ("created_at", DESCENDING)])
 col_invoices.create_index("invoice_id", unique=True)
 col_invoices.create_index("status")
@@ -109,10 +110,11 @@ GEMINI_MDL_FALLBACK = "gemini-2.5-flash"
 print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY}", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  KEEP-ALIVE THREAD
+#  BACKGROUND THREADS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _keep_alive():
+    """Pings the server every 5 min to prevent Render free-tier sleep."""
     time.sleep(60)
     while True:
         try:
@@ -123,13 +125,69 @@ def _keep_alive():
             print(f"⚠️  Keep-alive failed: {e}", flush=True)
         time.sleep(300)
 
-threading.Thread(target=_keep_alive, daemon=True).start()
+
+def _run_expiry_job():
+    """
+    Runs every hour. Finds used User IDs whose expires_at has passed,
+    marks associated users as membership_expired, deletes the User ID doc,
+    and decrements the gym's member count.
+    """
+    # Small initial delay so the server is fully up before first run
+    time.sleep(30)
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            expired_ids = list(col_user_ids.find({
+                "status":     "used",
+                "expires_at": {"$lte": now},
+            }))
+
+            if expired_ids:
+                print(f"⏰  Expiry job: processing {len(expired_ids)} expired User ID(s)", flush=True)
+
+            for uid_doc in expired_ids:
+                code    = uid_doc.get("code")
+                gym_id  = uid_doc.get("gym_id")
+                used_by = uid_doc.get("used_by")   # email of the member
+
+                # 1. Mark the user as membership_expired
+                if used_by:
+                    col_users.update_one(
+                        {"email": used_by},
+                        {"$set": {
+                            "membership_expired":    True,
+                            "membership_expired_at": now,
+                            "gym_id":                None,   # detach from gym
+                        }}
+                    )
+                    print(f"   ↳ Expired user: {used_by}", flush=True)
+
+                # 2. Delete the consumed User ID document
+                col_user_ids.delete_one({"gym_id": gym_id, "code": code})
+
+                # 3. Decrement gym member count (never go below 0)
+                col_gyms.update_one(
+                    {"gym_id": gym_id, "members": {"$gt": 0}},
+                    {"$inc": {"members": -1}}
+                )
+
+                print(f"   ↳ Deleted User ID: {code} — gym: {gym_id}", flush=True)
+
+        except Exception as e:
+            print(f"⚠️  Expiry job error: {e}", flush=True)
+
+        time.sleep(3600)   # run every hour
+
+
+threading.Thread(target=_keep_alive,      daemon=True).start()
+threading.Thread(target=_run_expiry_job,  daemon=True).start()
+print("✅  Background threads started (keep-alive + expiry job)", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="13.0.0")
+app = FastAPI(title="AERO-FIT API", version="14.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -358,7 +416,6 @@ class GymAdminUpdate(BaseModel):
 class ValidateUserIdRequest(BaseModel):
     user_id: str
 
-# ── Updated: plan_months field added (1–12) ───────────────────────────────────
 class GenerateUserIdsRequest(BaseModel):
     count:       int = 1
     plan_months: int = 1   # 1–12 months validity granted on registration
@@ -388,7 +445,7 @@ class UpdateUserIdPlan(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "13.0.0", "db": "mongodb", "ai": GEMINI_MDL_PRIMARY}
+    return {"status": "ok", "version": "14.0.0", "db": "mongodb", "ai": GEMINI_MDL_PRIMARY}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — ALPHA ADMIN AUTH
@@ -786,7 +843,6 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
 
-    # Clamp values
     count       = max(1, min(req.count, 50))
     plan_months = max(1, min(req.plan_months, 12))
     plan_label  = f"{plan_months} Month{'s' if plan_months > 1 else ''}"
@@ -803,12 +859,12 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
             "gym_id":      gym_id,
             "code":        code,
             "status":      "active",
-            "plan_months": plan_months,   # ✅ stored at generation time
-            "plan_label":  plan_label,    # ✅ human-readable label
+            "plan_months": plan_months,
+            "plan_label":  plan_label,
             "created_at":  now,
             "used_at":     None,
             "used_by":     None,
-            "expires_at":  None,          # ✅ set when a user actually registers
+            "expires_at":  None,   # set when a user registers
         })
         codes.append(code)
 
@@ -836,7 +892,6 @@ def validate_user_id(gym_id: str, req: ValidateUserIdRequest):
         return {"valid": False, "reason": "Code not found for this gym"}
     if doc.get("status") != "active":
         return {"valid": False, "reason": "Code has already been used"}
-    # Return plan info so the mobile app can show what plan the user is getting
     return {
         "valid":       True,
         "plan_months": doc.get("plan_months", 1),
@@ -850,7 +905,6 @@ def revoke_user_id(gym_id: str, code: str):
     if result.deleted_count == 0:
         raise HTTPException(404, "Active code not found")
     return {"status": "revoked", "code": code}
-
 
 @app.patch("/gym/{gym_id}/user-ids/{code}/plan")
 def update_user_id_plan(gym_id: str, code: str, req: UpdateUserIdPlan):
@@ -893,7 +947,6 @@ def add_user(req: AddUserRequest):
         if doc.get("status") != "active":
             raise HTTPException(400, "This User ID has already been used")
 
-        # ✅ Pull plan_months from the User ID doc and calculate expiry
         plan_months = doc.get("plan_months", 1)
         plan_label  = doc.get("plan_label", f"{plan_months} Month{'s' if plan_months > 1 else ''}")
         used_at     = datetime.now(timezone.utc)
@@ -905,22 +958,23 @@ def add_user(req: AddUserRequest):
                 "status":     "used",
                 "used_at":    used_at,
                 "used_by":    email,
-                "expires_at": expires_at,   # ✅ calculated from plan_months
+                "expires_at": expires_at,
             }},
         )
         col_gyms.update_one({"gym_id": gym_id}, {"$inc": {"members": 1}})
 
     hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
     col_users.insert_one({
-        "email":        email,
-        "name":         req.name.strip(),
-        "password":     hashed,
-        "weight_kg":    req.weight_kg,
-        "height_cm":    req.height_cm,
-        "gym_id":       req.gym_id or None,
-        "plan_months":  plan_months,   # ✅ stored on user doc too
-        "plan_label":   plan_label,
-        "created_at":   datetime.now(timezone.utc),
+        "email":               email,
+        "name":                req.name.strip(),
+        "password":            hashed,
+        "weight_kg":           req.weight_kg,
+        "height_cm":           req.height_cm,
+        "gym_id":              req.gym_id or None,
+        "plan_months":         plan_months,
+        "plan_label":          plan_label,
+        "membership_expired":  False,           # ✅ initialised as not expired
+        "created_at":          datetime.now(timezone.utc),
     })
     return {"status": "created", "email": email, "plan_months": plan_months, "plan_label": plan_label}
 
@@ -929,14 +983,15 @@ def list_users():
     docs = list(col_users.find().sort("created_at", DESCENDING))
     return [
         {
-            "email":       d["email"],
-            "name":        d["name"],
-            "weight_kg":   d["weight_kg"],
-            "height_cm":   d["height_cm"],
-            "gym_id":      d.get("gym_id"),
-            "plan_months": d.get("plan_months", 1),
-            "plan_label":  d.get("plan_label", "1 Month"),
-            "created_at":  _fmt_dt(d.get("created_at")),
+            "email":              d["email"],
+            "name":               d["name"],
+            "weight_kg":          d["weight_kg"],
+            "height_cm":          d["height_cm"],
+            "gym_id":             d.get("gym_id"),
+            "plan_months":        d.get("plan_months", 1),
+            "plan_label":         d.get("plan_label", "1 Month"),
+            "membership_expired": d.get("membership_expired", False),
+            "created_at":         _fmt_dt(d.get("created_at")),
         }
         for d in docs
     ]
@@ -960,17 +1015,33 @@ def user_login(req: UserLogin):
         raise HTTPException(401, "Invalid email or password")
     if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
         raise HTTPException(401, "Invalid email or password")
+
+    # ✅ Block login immediately if membership already flagged as expired
+    if user.get("membership_expired"):
+        raise HTTPException(403, "membership_expired")
+
     gym_name = ""
     if user.get("gym_id"):
         gym = col_gyms.find_one({"gym_id": user["gym_id"]})
         if gym:
             gym_name = gym.get("name", "")
 
-    # ✅ Fetch expires_at from the user's consumed User ID
+    # Fetch membership expiry from User ID doc
     membership_expires = None
     if user.get("gym_id"):
         uid_doc = col_user_ids.find_one({"used_by": email, "gym_id": user["gym_id"]})
         if uid_doc and uid_doc.get("expires_at"):
+            # ✅ Eager expiry check at login time (catches gap before hourly job runs)
+            if uid_doc["expires_at"] <= datetime.now(timezone.utc):
+                col_users.update_one(
+                    {"email": email},
+                    {"$set": {
+                        "membership_expired":    True,
+                        "membership_expired_at": datetime.now(timezone.utc),
+                        "gym_id":                None,
+                    }}
+                )
+                raise HTTPException(403, "membership_expired")
             membership_expires = _fmt_dt(uid_doc["expires_at"])
 
     return {
@@ -984,7 +1055,8 @@ def user_login(req: UserLogin):
             "gym_name":           gym_name,
             "plan_months":        user.get("plan_months", 1),
             "plan_label":         user.get("plan_label", "1 Month"),
-            "membership_expires": membership_expires,  # ✅ ISO string or null
+            "membership_expired": False,
+            "membership_expires": membership_expires,   # ✅ ISO string or null
         },
     }
 
@@ -1014,6 +1086,7 @@ def get_user(email: str):
         "gym_name":           gym_name,
         "plan_months":        user.get("plan_months", 1),
         "plan_label":         user.get("plan_label", "1 Month"),
+        "membership_expired": user.get("membership_expired", False),
         "membership_expires": membership_expires,
     }
 
@@ -1028,6 +1101,69 @@ def update_user(email: str, req: UserUpdate):
     if req.height_cm is not None: update["height_cm"] = req.height_cm
     col_users.update_one({"email": email}, {"$set": update})
     return {"status": "updated"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — MEMBERSHIP STATUS  ✅ new
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/user/{email}/membership-status")
+def membership_status(email: str):
+    """
+    Flutter polls this endpoint:
+      - Once per hour (background timer)
+      - On every app resume (foreground event)
+    Returns { valid, reason, expires_at? }
+    """
+    email = email.strip().lower()
+    user  = col_users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # Already flagged by the expiry job or a previous login check
+    if user.get("membership_expired"):
+        return {
+            "valid":      False,
+            "reason":     "expired",
+            "expired_at": _fmt_dt(user.get("membership_expired_at")),
+        }
+
+    # Plain users (no gym) never expire
+    if not user.get("gym_id"):
+        return {"valid": True, "reason": "no_gym"}
+
+    # Check the live User ID document directly
+    uid_doc = col_user_ids.find_one({
+        "used_by": email,
+        "gym_id":  user["gym_id"],
+    })
+
+    now = datetime.now(timezone.utc)
+
+    if uid_doc:
+        expires_at = uid_doc.get("expires_at")
+        if expires_at and expires_at <= now:
+            # Proactively mark — hourly job will delete the UID doc within 60 min
+            col_users.update_one(
+                {"email": email},
+                {"$set": {
+                    "membership_expired":    True,
+                    "membership_expired_at": now,
+                    "gym_id":                None,
+                }}
+            )
+            return {
+                "valid":      False,
+                "reason":     "expired",
+                "expired_at": _fmt_dt(expires_at),
+            }
+        return {
+            "valid":      True,
+            "reason":     "active",
+            "expires_at": _fmt_dt(expires_at),
+        }
+
+    # No UID doc found — could be a plain user whose gym_id wasn't cleared
+    return {"valid": True, "reason": "active"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — BANNERS
