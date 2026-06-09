@@ -843,7 +843,7 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
 
-    count       = max(1, min(req.count, 50))
+    count = max(1, req.count)
     plan_months = max(1, min(req.plan_months, 12))
     plan_label  = f"{plan_months} Month{'s' if plan_months > 1 else ''}"
 
