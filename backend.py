@@ -289,6 +289,15 @@ def upload_image(base64_str: str, folder: str, public_id: str = None) -> str:
     )
     return result.get("secure_url", "")
 
+# ADD THIS NEW FUNCTION
+def _ensure_utc(dt) -> datetime:
+    """Make a naive datetime timezone-aware (UTC). Safe to call on aware datetimes too."""
+    if dt is None:
+        return None
+    if isinstance(dt, datetime) and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
 def _check_and_increment_scan_limit(email: str) -> int:
     today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     filter = {"email": email, "date": today}
@@ -1032,7 +1041,7 @@ def user_login(req: UserLogin):
         uid_doc = col_user_ids.find_one({"used_by": email, "gym_id": user["gym_id"]})
         if uid_doc and uid_doc.get("expires_at"):
             # ✅ Eager expiry check at login time (catches gap before hourly job runs)
-            if uid_doc["expires_at"] <= datetime.now(timezone.utc):
+            if _ensure_utc(uid_doc["expires_at"]) <= datetime.now(timezone.utc):
                 col_users.update_one(
                     {"email": email},
                     {"$set": {
@@ -1141,7 +1150,7 @@ def membership_status(email: str):
 
     if uid_doc:
         expires_at = uid_doc.get("expires_at")
-        if expires_at and expires_at <= now:
+        if expires_at and _ensure_utc(expires_at) <= now:
             # Proactively mark — hourly job will delete the UID doc within 60 min
             col_users.update_one(
                 {"email": email},
