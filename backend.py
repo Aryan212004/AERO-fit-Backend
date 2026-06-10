@@ -1214,9 +1214,26 @@ def list_banners(gym_id: str, screen: str = None):
 def delete_banner(gym_id: str, banner_id: str):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-    result = col_banners.delete_one({"banner_id": banner_id, "gym_id": gym_id})
-    if result.deleted_count == 0:
+
+    # Fetch doc first so we can get the Cloudinary public_id before deleting
+    banner = col_banners.find_one({"banner_id": banner_id, "gym_id": gym_id})
+    if not banner:
         raise HTTPException(404, "Banner not found or belongs to a different gym")
+
+    # Delete the image from Cloudinary if one was uploaded
+    image_url = banner.get("image_url", "")
+    if image_url:
+        try:
+            # public_id matches what upload_image() set: "aerofitdb/banners/<banner_id>"
+            public_id = f"aerofitdb/banners/{banner_id}"
+            cloudinary.uploader.destroy(public_id, resource_type="image")
+            print(f"✅  Cloudinary image deleted → {public_id}", flush=True)
+        except Exception as e:
+            # Non-fatal — log but don't block the DB delete
+            print(f"⚠️  Cloudinary delete failed for {banner_id}: {e}", flush=True)
+
+    # Delete from MongoDB
+    col_banners.delete_one({"banner_id": banner_id, "gym_id": gym_id})
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
