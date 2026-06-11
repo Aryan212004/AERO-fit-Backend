@@ -32,9 +32,12 @@ CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
 SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
 
 # ── Concurrency: cap simultaneous Gemini calls ────────────────────────────────
-# Tune via env var. Default 6 is safe for Gemini Flash Lite on a free plan.
-# Raise to 10–15 on a paid plan or dedicated server.
-MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "6"))
+# You're on Tier 1 Postpay → Gemini Flash Lite allows 4000 RPM.
+# Render is the real bottleneck. 50 concurrent Gemini threads is safe on Standard plan.
+# Each request that can't get a slot immediately queues in asyncio (no memory cost).
+# If it waits longer than SCAN_QUEUE_TIMEOUT_S seconds it gets a 503.
+MAX_CONCURRENT_SCANS   = int(os.environ.get("MAX_CONCURRENT_SCANS",   "50"))
+SCAN_QUEUE_TIMEOUT_S   = int(os.environ.get("SCAN_QUEUE_TIMEOUT_S",   "60"))   # max queue wait
 
 ALPHA_USERNAME = os.environ.get("ALPHA_USERNAME", "superadmin").strip()
 ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
@@ -115,17 +118,23 @@ print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY}", flush=True)
 #  CONCURRENCY CONTROLS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Global semaphore: limits simultaneous Gemini calls server-wide
+# Global semaphore: limits simultaneous Gemini calls server-wide.
+# Requests waiting for a slot sit in asyncio queue (zero CPU cost).
+# If a request waits longer than SCAN_QUEUE_TIMEOUT_S seconds, it gets 503.
 _gemini_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
 
+# Queue depth counter: how many requests are currently WAITING (not yet running).
+# Hard cap MAX_QUEUE_DEPTH: if queue is already this deep, reject immediately.
+# Protects against memory exhaustion when thousands pile up simultaneously.
+MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "200"))
+_queue_depth    = 0   # only mutated inside asyncio event loop, no lock needed
+
 # Per-user in-flight lock: prevents one user from queuing multiple scans
-# Maps email → asyncio.Lock (created lazily, cleaned up after release)
 _user_scan_locks: dict[str, asyncio.Lock] = {}
-_user_locks_meta: dict[str, float]        = {}  # email → timestamp for cleanup
+_user_locks_meta: dict[str, float]        = {}
 _locks_registry_lock = asyncio.Lock()
 
 async def _get_user_lock(email: str) -> asyncio.Lock:
-    """Returns a per-user lock, creating it lazily."""
     async with _locks_registry_lock:
         if email not in _user_scan_locks:
             _user_scan_locks[email] = asyncio.Lock()
@@ -133,7 +142,6 @@ async def _get_user_lock(email: str) -> asyncio.Lock:
         return _user_scan_locks[email]
 
 async def _cleanup_stale_locks():
-    """Removes per-user locks that haven't been touched in 10 minutes."""
     async with _locks_registry_lock:
         stale_cutoff = time.monotonic() - 600
         stale = [e for e, t in _user_locks_meta.items()
@@ -144,7 +152,7 @@ async def _cleanup_stale_locks():
         if stale:
             print(f"🧹  Cleaned up {len(stale)} stale user lock(s)", flush=True)
 
-print(f"✅  Concurrency controls ready → max {MAX_CONCURRENT_SCANS} concurrent scans", flush=True)
+print(f"✅  Concurrency controls ready → {MAX_CONCURRENT_SCANS} active slots / {MAX_QUEUE_DEPTH} max queue depth", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BACKGROUND THREADS
