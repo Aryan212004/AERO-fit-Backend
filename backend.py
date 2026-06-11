@@ -5,6 +5,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+import razorpay
+import hmac
+import hashlib
 
 # ── Load .env for local dev (no-op on Render) ─────────────────────────────────
 try:
@@ -45,6 +48,15 @@ ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 PLATFORM_SHARE_PCT = 40
 GYM_SHARE_PCT      = 60
 
+RAZORPAY_KEY_ID     = _require("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = _require("RAZORPAY_KEY_SECRET")
+ 
+INDIE_BASE_PRICE    = float(os.environ.get("INDIE_BASE_PRICE", "159"))   # ₹/month
+INDIE_DISCOUNT_PCT  = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month
+ 
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+print(f"✅  Razorpay configured → key {RAZORPAY_KEY_ID[:12]}…", flush=True)
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONGODB INIT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -84,6 +96,12 @@ col_user_ids.create_index([("status", 1), ("expires_at", 1)])
 col_invoices.create_index([("gym_id", 1), ("created_at", DESCENDING)])
 col_invoices.create_index("invoice_id", unique=True)
 col_invoices.create_index("status")
+col_payments: Collection = mdb["indie_payments"]
+col_payments.create_index("order_id", unique=True)
+col_payments.create_index("payment_id")
+col_payments.create_index("email")
+col_payments.create_index([("email", 1), ("status", 1)])
+ 
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -348,6 +366,27 @@ def _generate_code() -> str:
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "AF-" + "".join(__import__("random").choice(chars) for _ in range(4))
 
+def _indie_pricing(months: int) -> dict:
+    """
+    Base price ₹159/month.
+    Discount = months% off total (1 month = 0%, 2 months = 2%, …, 12 months = 12%).
+    Returns amounts in paise (Razorpay uses paise).
+    """
+    months        = max(1, min(months, 12))
+    discount_pct  = (months - 1) * INDIE_DISCOUNT_PCT   # 0% for 1 month, 1% for 2, …
+    gross_inr     = round(INDIE_BASE_PRICE * months, 2)
+    discount_inr  = round(gross_inr * discount_pct / 100, 2)
+    final_inr     = round(gross_inr - discount_inr, 2)
+    return {
+        "months":        months,
+        "base_price":    INDIE_BASE_PRICE,
+        "gross_inr":     gross_inr,
+        "discount_pct":  discount_pct,
+        "discount_inr":  discount_inr,
+        "final_inr":     final_inr,
+        "final_paise":   int(final_inr * 100),           # Razorpay needs paise
+    }
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  BILLING HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -480,6 +519,22 @@ class InvoiceAlert(BaseModel):
 
 class UpdateUserIdPlan(BaseModel):
     plan_months: int
+
+class IndieOrderRequest(BaseModel):
+    """Step 1 — Flutter calls this before showing Razorpay checkout."""
+    months:     int    # 1–12
+    email:      str    # pending user email (not yet in DB)
+    name:       str
+    password:   str
+    weight_kg:  float
+    height_cm:  float
+ 
+class IndieVerifyRequest(BaseModel):
+    """Step 2 — Flutter calls this after Razorpay returns success."""
+    razorpay_order_id:   str
+    razorpay_payment_id: str
+    razorpay_signature:  str
+ 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -1454,6 +1509,181 @@ def delete_meal(meal_id: str):
     if result.deleted_count == 0:
         raise HTTPException(404, "Meal not found")
     return {"status": "deleted"}
+
+
+@app.get("/indie/pricing/{months}")
+def indie_pricing(months: int):
+    """Preview pricing for N months — called while user is selecting plan."""
+    if months < 1 or months > 12:
+        raise HTTPException(400, "months must be 1–12")
+    return _indie_pricing(months)
+ 
+ 
+@app.post("/indie/create-order")
+def indie_create_order(req: IndieOrderRequest):
+    """
+    Creates a Razorpay order and stores a pending payment record.
+    Flutter opens Razorpay checkout with the returned order_id + key_id.
+    The user is NOT registered yet — registration happens only after payment.
+    """
+    email = req.email.strip().lower()
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
+        raise HTTPException(400, "Invalid email address")
+    if col_users.find_one({"email": email}):
+        raise HTTPException(409, "An account with this email already exists")
+ 
+    months  = max(1, min(req.months, 12))
+    pricing = _indie_pricing(months)
+    now     = datetime.now(timezone.utc)
+ 
+    # Create Razorpay order
+    try:
+        rp_order = razorpay_client.order.create({
+            "amount":   pricing["final_paise"],
+            "currency": "INR",
+            "receipt":  f"indie_{email[:20]}_{now.strftime('%Y%m%d%H%M%S')}",
+            "notes": {
+                "email":  email,
+                "months": str(months),
+                "app":    "aerofit",
+            },
+        })
+    except Exception as e:
+        print(f"❌  Razorpay order creation failed: {e}", flush=True)
+        raise HTTPException(502, "Payment gateway error. Please try again.")
+ 
+    order_id = rp_order["id"]
+ 
+    # Persist pending record (includes encrypted password for post-payment registration)
+    hashed_pw = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+ 
+    col_payments.insert_one({
+        "order_id":     order_id,
+        "payment_id":   None,
+        "email":        email,
+        "name":         req.name.strip(),
+        "password":     hashed_pw,
+        "weight_kg":    req.weight_kg,
+        "height_cm":    req.height_cm,
+        "months":       months,
+        "amount_inr":   pricing["final_inr"],
+        "amount_paise": pricing["final_paise"],
+        "discount_pct": pricing["discount_pct"],
+        "status":       "pending",
+        "created_at":   now,
+        "verified_at":  None,
+    })
+ 
+    print(f"✅  Indie order created → {order_id}  {email}  {months}mo  ₹{pricing['final_inr']}", flush=True)
+    return {
+        "order_id":   order_id,
+        "key_id":     RAZORPAY_KEY_ID,
+        "amount":     pricing["final_paise"],
+        "currency":   "INR",
+        "name":       "AERO-FIT",
+        "description": f"{months} Month{'s' if months > 1 else ''} — Independent Plan",
+        "prefill_email": email,
+        "prefill_name":  req.name.strip(),
+        **pricing,
+    }
+ 
+ 
+@app.post("/indie/verify-payment")
+def indie_verify_payment(req: IndieVerifyRequest):
+    """
+    1. Verifies Razorpay HMAC signature (prevents spoofing).
+    2. Registers the user account.
+    3. Sets membership plan_months + expires_at.
+    4. Returns user object so Flutter can auto-login.
+    """
+    # ── 1. HMAC signature check ────────────────────────────────────────────────
+    msg       = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
+    expected  = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        msg.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+ 
+    if not hmac.compare_digest(expected, req.razorpay_signature):
+        raise HTTPException(400, "Payment verification failed. Signature mismatch.")
+ 
+    # ── 2. Find the pending order ──────────────────────────────────────────────
+    pending = col_payments.find_one({
+        "order_id": req.razorpay_order_id,
+        "status":   "pending",
+    })
+    if not pending:
+        raise HTTPException(404, "Order not found or already processed")
+ 
+    email  = pending["email"]
+    months = pending["months"]
+    now    = datetime.now(timezone.utc)
+ 
+    # ── 3. Guard: user might have registered via another flow in the meantime ──
+    if col_users.find_one({"email": email}):
+        raise HTTPException(409, "Account already exists for this email")
+ 
+    # ── 4. Register user ───────────────────────────────────────────────────────
+    expires_at = now + timedelta(days=30 * months)
+ 
+    col_users.insert_one({
+        "email":               email,
+        "name":                pending["name"],
+        "password":            pending["password"],   # already bcrypt-hashed
+        "weight_kg":           pending["weight_kg"],
+        "height_cm":           pending["height_cm"],
+        "gym_id":              None,
+        "plan_months":         months,
+        "plan_label":          f"{months} Month{'s' if months > 1 else ''}",
+        "indie_plan":          True,
+        "indie_expires_at":    expires_at,
+        "membership_expired":  False,
+        "created_at":          now,
+    })
+ 
+    # ── 5. Mark payment as verified ───────────────────────────────────────────
+    col_payments.update_one(
+        {"order_id": req.razorpay_order_id},
+        {"$set": {
+            "payment_id":  req.razorpay_payment_id,
+            "status":      "paid",
+            "verified_at": now,
+        }},
+    )
+ 
+    print(f"✅  Payment verified → {email}  {months}mo  ₹{pending['amount_inr']}  pid={req.razorpay_payment_id}", flush=True)
+    return {
+        "status": "ok",
+        "user": {
+            "email":              email,
+            "name":               pending["name"],
+            "weight_kg":          pending["weight_kg"],
+            "height_cm":          pending["height_cm"],
+            "gym_id":             None,
+            "gym_name":           "",
+            "plan_months":        months,
+            "plan_label":         f"{months} Month{'s' if months > 1 else ''}",
+            "indie_plan":         True,
+            "indie_expires_at":   expires_at.isoformat(),
+            "membership_expired": False,
+            "membership_expires": expires_at.isoformat(),
+        },
+    }
+ 
+ 
+@app.get("/indie/payment-status/{order_id}")
+def indie_payment_status(order_id: str):
+    """Lets Flutter poll for payment status (useful for webhook fallback)."""
+    doc = col_payments.find_one({"order_id": order_id})
+    if not doc:
+        raise HTTPException(404, "Order not found")
+    return {
+        "order_id":  order_id,
+        "status":    doc.get("status"),
+        "email":     doc.get("email"),
+        "months":    doc.get("months"),
+        "amount_inr": doc.get("amount_inr"),
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
