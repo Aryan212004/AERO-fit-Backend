@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: aero-fit-backend
+    runtime: python
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python backend.py
