@@ -1,4 +1,4 @@
-import os, sys, json, re, bcrypt, uuid, base64, traceback, threading, time
+import os, sys, json, re, bcrypt, uuid, base64, traceback, threading, time, asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
@@ -31,12 +31,16 @@ CLOUDINARY_API_KEY = _require("CLOUDINARY_API_KEY")
 CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
 SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
 
+# ── Concurrency: cap simultaneous Gemini calls ────────────────────────────────
+# Tune via env var. Default 6 is safe for Gemini Flash Lite on a free plan.
+# Raise to 10–15 on a paid plan or dedicated server.
+MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "6"))
+
 ALPHA_USERNAME = os.environ.get("ALPHA_USERNAME", "superadmin").strip()
 ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 
-# ── Revenue split constants ───────────────────────────────────────────────────
-PLATFORM_SHARE_PCT = 40   # % that goes to Aerofit platform
-GYM_SHARE_PCT      = 60   # % that stays with gym admin
+PLATFORM_SHARE_PCT = 40
+GYM_SHARE_PCT      = 60
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONGODB INIT
@@ -49,7 +53,6 @@ _mongo_client: MongoClient = MongoClient(MONGO_URI)
 _db_name = MONGO_URI.rsplit("/", 1)[-1].split("?")[0].strip() or "aerofitdb"
 mdb = _mongo_client[_db_name]
 
-# ── Collections ───────────────────────────────────────────────────────────────
 col_users:       Collection = mdb["users"]
 col_meals:       Collection = mdb["meals"]
 col_banners:     Collection = mdb["banners"]
@@ -60,7 +63,6 @@ col_gym_admins:  Collection = mdb["platform_gym_admins"]
 col_user_ids:    Collection = mdb["gym_user_ids"]
 col_invoices:    Collection = mdb["invoices"]
 
-# ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
 col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
 col_banners.create_index("created_at")
@@ -75,7 +77,7 @@ col_gym_admins.create_index("email", unique=True)
 col_gym_admins.create_index("gym_id")
 col_user_ids.create_index([("gym_id", 1), ("code", 1)], unique=True)
 col_user_ids.create_index("code")
-col_user_ids.create_index([("status", 1), ("expires_at", 1)])   # ✅ expiry job index
+col_user_ids.create_index([("status", 1), ("expires_at", 1)])
 col_invoices.create_index([("gym_id", 1), ("created_at", DESCENDING)])
 col_invoices.create_index("invoice_id", unique=True)
 col_invoices.create_index("status")
@@ -110,6 +112,41 @@ GEMINI_MDL_FALLBACK = "gemini-2.5-flash"
 print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY}", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CONCURRENCY CONTROLS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Global semaphore: limits simultaneous Gemini calls server-wide
+_gemini_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
+# Per-user in-flight lock: prevents one user from queuing multiple scans
+# Maps email → asyncio.Lock (created lazily, cleaned up after release)
+_user_scan_locks: dict[str, asyncio.Lock] = {}
+_user_locks_meta: dict[str, float]        = {}  # email → timestamp for cleanup
+_locks_registry_lock = asyncio.Lock()
+
+async def _get_user_lock(email: str) -> asyncio.Lock:
+    """Returns a per-user lock, creating it lazily."""
+    async with _locks_registry_lock:
+        if email not in _user_scan_locks:
+            _user_scan_locks[email] = asyncio.Lock()
+        _user_locks_meta[email] = time.monotonic()
+        return _user_scan_locks[email]
+
+async def _cleanup_stale_locks():
+    """Removes per-user locks that haven't been touched in 10 minutes."""
+    async with _locks_registry_lock:
+        stale_cutoff = time.monotonic() - 600
+        stale = [e for e, t in _user_locks_meta.items()
+                 if t < stale_cutoff and not _user_scan_locks[e].locked()]
+        for e in stale:
+            del _user_scan_locks[e]
+            del _user_locks_meta[e]
+        if stale:
+            print(f"🧹  Cleaned up {len(stale)} stale user lock(s)", flush=True)
+
+print(f"✅  Concurrency controls ready → max {MAX_CONCURRENT_SCANS} concurrent scans", flush=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  BACKGROUND THREADS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -127,12 +164,7 @@ def _keep_alive():
 
 
 def _run_expiry_job():
-    """
-    Runs every hour. Finds used User IDs whose expires_at has passed,
-    marks associated users as membership_expired, deletes the User ID doc,
-    and decrements the gym's member count.
-    """
-    # Small initial delay so the server is fully up before first run
+    """Hourly job: expire memberships whose expires_at has passed."""
     time.sleep(30)
     while True:
         try:
@@ -148,46 +180,41 @@ def _run_expiry_job():
             for uid_doc in expired_ids:
                 code    = uid_doc.get("code")
                 gym_id  = uid_doc.get("gym_id")
-                used_by = uid_doc.get("used_by")   # email of the member
+                used_by = uid_doc.get("used_by")
 
-                # 1. Mark the user as membership_expired
                 if used_by:
                     col_users.update_one(
                         {"email": used_by},
                         {"$set": {
                             "membership_expired":    True,
                             "membership_expired_at": now,
-                            "gym_id":                None,   # detach from gym
+                            "gym_id":                None,
                         }}
                     )
                     print(f"   ↳ Expired user: {used_by}", flush=True)
 
-                # 2. Delete the consumed User ID document
                 col_user_ids.delete_one({"gym_id": gym_id, "code": code})
-
-                # 3. Decrement gym member count (never go below 0)
                 col_gyms.update_one(
                     {"gym_id": gym_id, "members": {"$gt": 0}},
                     {"$inc": {"members": -1}}
                 )
-
                 print(f"   ↳ Deleted User ID: {code} — gym: {gym_id}", flush=True)
 
         except Exception as e:
             print(f"⚠️  Expiry job error: {e}", flush=True)
 
-        time.sleep(3600)   # run every hour
+        time.sleep(3600)
 
 
-threading.Thread(target=_keep_alive,      daemon=True).start()
-threading.Thread(target=_run_expiry_job,  daemon=True).start()
+threading.Thread(target=_keep_alive,     daemon=True).start()
+threading.Thread(target=_run_expiry_job, daemon=True).start()
 print("✅  Background threads started (keep-alive + expiry job)", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="14.0.0")
+app = FastAPI(title="AERO-FIT API", version="15.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -200,7 +227,7 @@ app.add_middleware(
     allow_credentials = False,
     allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers     = ["*"],
-    expose_headers    = ["*"],
+    expose_headers    = ["*", "Retry-After"],   # expose Retry-After to Flutter
     max_age           = 3600,
 )
 
@@ -289,9 +316,7 @@ def upload_image(base64_str: str, folder: str, public_id: str = None) -> str:
     )
     return result.get("secure_url", "")
 
-# ADD THIS NEW FUNCTION
 def _ensure_utc(dt) -> datetime:
-    """Make a naive datetime timezone-aware (UTC). Safe to call on aware datetimes too."""
     if dt is None:
         return None
     if isinstance(dt, datetime) and dt.tzinfo is None:
@@ -427,7 +452,7 @@ class ValidateUserIdRequest(BaseModel):
 
 class GenerateUserIdsRequest(BaseModel):
     count:       int = 1
-    plan_months: int = 1   # 1–12 months validity granted on registration
+    plan_months: int = 1
 
 class InvoiceCreate(BaseModel):
     gym_id:       str
@@ -446,7 +471,7 @@ class InvoiceAlert(BaseModel):
     alert_type: str = "payment_reminder"
 
 class UpdateUserIdPlan(BaseModel):
-    plan_months: int  # 1–12
+    plan_months: int
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -454,7 +479,15 @@ class UpdateUserIdPlan(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "14.0.0", "db": "mongodb", "ai": GEMINI_MDL_PRIMARY}
+    return {
+        "status":          "ok",
+        "version":         "15.0.0",
+        "db":              "mongodb",
+        "ai":              GEMINI_MDL_PRIMARY,
+        "max_concurrent":  MAX_CONCURRENT_SCANS,
+        # Active scan count for monitoring dashboards
+        "active_scans":    MAX_CONCURRENT_SCANS - _gemini_semaphore._value,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — ALPHA ADMIN AUTH
@@ -666,12 +699,11 @@ def delete_gym_admin(admin_id: str):
     return {"status": "deleted", "admin_id": admin_id}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — INVOICES  (super admin creates, gym admin views)
+#  ROUTES — INVOICES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/alpha/invoices")
 def create_invoice(req: InvoiceCreate):
-    """Super admin generates invoice. Member count is auto-calculated from used User IDs."""
     gym = col_gyms.find_one({"gym_id": req.gym_id})
     if not gym:
         raise HTTPException(404, "Gym not found")
@@ -781,7 +813,6 @@ def send_invoice_alert(invoice_id: str, req: InvoiceAlert):
     }
 
     col_invoices.update_one({"invoice_id": invoice_id}, {"$push": {"alerts": alert_doc}})
-
     col_notifs.insert_one({
         "notification_id": str(uuid.uuid4()),
         "gym_id":          inv["gym_id"],
@@ -807,7 +838,7 @@ def _alert_title(alert_type: str, inv_number: str) -> str:
     return MAP.get(alert_type, f"📋 Invoice Alert — {inv_number}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — INVOICES (gym admin view — read-only)
+#  ROUTES — INVOICES (gym admin view)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/gym/{gym_id}/invoices")
@@ -852,7 +883,7 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
 
-    count = max(1, req.count)
+    count       = max(1, req.count)
     plan_months = max(1, min(req.plan_months, 12))
     plan_label  = f"{plan_months} Month{'s' if plan_months > 1 else ''}"
 
@@ -873,7 +904,7 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
             "created_at":  now,
             "used_at":     None,
             "used_by":     None,
-            "expires_at":  None,   # set when a user registers
+            "expires_at":  None,
         })
         codes.append(code)
 
@@ -982,7 +1013,7 @@ def add_user(req: AddUserRequest):
         "gym_id":              req.gym_id or None,
         "plan_months":         plan_months,
         "plan_label":          plan_label,
-        "membership_expired":  False,           # ✅ initialised as not expired
+        "membership_expired":  False,
         "created_at":          datetime.now(timezone.utc),
     })
     return {"status": "created", "email": email, "plan_months": plan_months, "plan_label": plan_label}
@@ -1025,7 +1056,6 @@ def user_login(req: UserLogin):
     if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
         raise HTTPException(401, "Invalid email or password")
 
-    # ✅ Block login immediately if membership already flagged as expired
     if user.get("membership_expired"):
         raise HTTPException(403, "membership_expired")
 
@@ -1035,12 +1065,10 @@ def user_login(req: UserLogin):
         if gym:
             gym_name = gym.get("name", "")
 
-    # Fetch membership expiry from User ID doc
     membership_expires = None
     if user.get("gym_id"):
         uid_doc = col_user_ids.find_one({"used_by": email, "gym_id": user["gym_id"]})
         if uid_doc and uid_doc.get("expires_at"):
-            # ✅ Eager expiry check at login time (catches gap before hourly job runs)
             if _ensure_utc(uid_doc["expires_at"]) <= datetime.now(timezone.utc):
                 col_users.update_one(
                     {"email": email},
@@ -1065,7 +1093,7 @@ def user_login(req: UserLogin):
             "plan_months":        user.get("plan_months", 1),
             "plan_label":         user.get("plan_label", "1 Month"),
             "membership_expired": False,
-            "membership_expires": membership_expires,   # ✅ ISO string or null
+            "membership_expires": membership_expires,
         },
     }
 
@@ -1112,23 +1140,16 @@ def update_user(email: str, req: UserUpdate):
     return {"status": "updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — MEMBERSHIP STATUS  ✅ new
+#  ROUTES — MEMBERSHIP STATUS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/user/{email}/membership-status")
 def membership_status(email: str):
-    """
-    Flutter polls this endpoint:
-      - Once per hour (background timer)
-      - On every app resume (foreground event)
-    Returns { valid, reason, expires_at? }
-    """
     email = email.strip().lower()
     user  = col_users.find_one({"email": email})
     if not user:
         raise HTTPException(404, "User not found")
 
-    # Already flagged by the expiry job or a previous login check
     if user.get("membership_expired"):
         return {
             "valid":      False,
@@ -1136,11 +1157,9 @@ def membership_status(email: str):
             "expired_at": _fmt_dt(user.get("membership_expired_at")),
         }
 
-    # Plain users (no gym) never expire
     if not user.get("gym_id"):
         return {"valid": True, "reason": "no_gym"}
 
-    # Check the live User ID document directly
     uid_doc = col_user_ids.find_one({
         "used_by": email,
         "gym_id":  user["gym_id"],
@@ -1151,7 +1170,6 @@ def membership_status(email: str):
     if uid_doc:
         expires_at = uid_doc.get("expires_at")
         if expires_at and _ensure_utc(expires_at) <= now:
-            # Proactively mark — hourly job will delete the UID doc within 60 min
             col_users.update_one(
                 {"email": email},
                 {"$set": {
@@ -1171,7 +1189,6 @@ def membership_status(email: str):
             "expires_at": _fmt_dt(expires_at),
         }
 
-    # No UID doc found — could be a plain user whose gym_id wasn't cleared
     return {"valid": True, "reason": "active"}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1215,24 +1232,19 @@ def delete_banner(gym_id: str, banner_id: str):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
 
-    # Fetch doc first so we can get the Cloudinary public_id before deleting
     banner = col_banners.find_one({"banner_id": banner_id, "gym_id": gym_id})
     if not banner:
         raise HTTPException(404, "Banner not found or belongs to a different gym")
 
-    # Delete the image from Cloudinary if one was uploaded
     image_url = banner.get("image_url", "")
     if image_url:
         try:
-            # public_id matches what upload_image() set: "aerofitdb/banners/<banner_id>"
             public_id = f"aerofitdb/banners/{banner_id}"
             cloudinary.uploader.destroy(public_id, resource_type="image")
             print(f"✅  Cloudinary image deleted → {public_id}", flush=True)
         except Exception as e:
-            # Non-fatal — log but don't block the DB delete
             print(f"⚠️  Cloudinary delete failed for {banner_id}: {e}", flush=True)
 
-    # Delete from MongoDB
     col_banners.delete_one({"banner_id": banner_id, "gym_id": gym_id})
     return {"status": "deleted"}
 
@@ -1285,41 +1297,110 @@ def get_scan_limit(email: str):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     doc   = col_scan_limits.find_one({"email": email.lower(), "date": today})
     used  = doc.get("count", 0) if doc else 0
-    return {"email": email.lower(), "used": used, "limit": SCAN_LIMIT, "remaining": max(0, SCAN_LIMIT - used)}
+    return {
+        "email":     email.lower(),
+        "used":      used,
+        "limit":     SCAN_LIMIT,
+        "remaining": max(0, SCAN_LIMIT - used),
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — MEALS
+#  ROUTES — MEALS  (async for semaphore compatibility)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/analyze-meal")
-def analyze_meal(req: MealRequest):
-    try:
-        remaining = 0
-        if req.email:
-            remaining = _check_and_increment_scan_limit(req.email.strip().lower())
-        image_part = _b64_to_part(req.image_base64)
-        prompt = (
-            "Estimate nutrition for the EXACT portion shown. Return ONLY JSON:\n"
-            '{"name":"","serving_size":"","kcal":0,"protein":0,"carbs":0,"fat":0,"fiber":0,"notes":""}'
+async def analyze_meal(req: MealRequest):
+    """
+    Concurrency-safe meal analysis:
+      1. Per-user lock  → rejects a second scan from the same user while one is running
+      2. Global semaphore → caps total simultaneous Gemini calls; returns 503 if full
+    Both controls are released immediately after the Gemini call completes.
+    """
+    email = req.email.strip().lower() if req.email else ""
+
+    # ── 1. Per-user lock ──────────────────────────────────────────────────────
+    user_lock = await _get_user_lock(email) if email else None
+
+    if user_lock and user_lock.locked():
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "A scan is already in progress for your account. Please wait."},
         )
-        text = _ask_gemini([image_part], prompt)
-        d    = _extract_json(text)
-        return {
-            "name":            str(d.get("name",         "Meal")),
-            "serving_size":    str(d.get("serving_size", "1 serving")),
-            "kcal":            _safe_int(d.get("kcal")),
-            "protein":         _safe_int(d.get("protein")),
-            "carbs":           _safe_int(d.get("carbs")),
-            "fat":             _safe_int(d.get("fat")),
-            "fiber":           _safe_int(d.get("fiber")),
-            "notes":           str(d.get("notes", "")),
-            "scans_remaining": remaining,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Analysis failed: {str(e)}")
+
+    async def _run_analysis():
+        # ── 2. Global Gemini semaphore ────────────────────────────────────────
+        if _gemini_semaphore.locked() and _gemini_semaphore._value == 0:
+            # All slots full — tell client to retry in ~10 seconds
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Server is busy. Please try again shortly."},
+                headers={"Retry-After": "10"},
+            )
+
+        try:
+            async with _gemini_semaphore:
+                # Scan limit check (must happen after we've acquired the semaphore
+                # to ensure the count update is atomic with the Gemini call)
+                remaining = 0
+                if email:
+                    try:
+                        remaining = _check_and_increment_scan_limit(email)
+                    except HTTPException as e:
+                        if e.status_code == 429:
+                            return JSONResponse(
+                                status_code=429,
+                                content={"detail": e.detail},
+                            )
+                        raise
+
+                # Run Gemini in a thread pool (it's a sync call)
+                image_part = _b64_to_part(req.image_base64)
+                prompt = (
+                    "Estimate nutrition for the EXACT portion shown. Return ONLY JSON:\n"
+                    '{"name":"","serving_size":"","kcal":0,"protein":0,"carbs":0,"fat":0,"fiber":0,"notes":""}'
+                )
+                loop = asyncio.get_running_loop()
+                text = await loop.run_in_executor(
+                    None,
+                    lambda: _ask_gemini([image_part], prompt),
+                )
+
+                d = _extract_json(text)
+                result = {
+                    "name":            str(d.get("name",         "Meal")),
+                    "serving_size":    str(d.get("serving_size", "1 serving")),
+                    "kcal":            _safe_int(d.get("kcal")),
+                    "protein":         _safe_int(d.get("protein")),
+                    "carbs":           _safe_int(d.get("carbs")),
+                    "fat":             _safe_int(d.get("fat")),
+                    "fiber":           _safe_int(d.get("fiber")),
+                    "notes":           str(d.get("notes", "")),
+                    "scans_remaining": remaining,
+                }
+
+                print(f"✅  Scan → {email or 'anon'}  {result['name']}  {result['kcal']} kcal  "
+                      f"[{MAX_CONCURRENT_SCANS - _gemini_semaphore._value}/{MAX_CONCURRENT_SCANS} slots]",
+                      flush=True)
+                return result
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(500, f"Analysis failed: {str(e)}")
+
+    if user_lock:
+        async with user_lock:
+            result = await _run_analysis()
+    else:
+        result = await _run_analysis()
+
+    # Periodic lock cleanup (every ~100 requests, non-blocking)
+    if hash(email) % 100 == 0:
+        asyncio.create_task(_cleanup_stale_locks())
+
+    return result
+
 
 @app.post("/log-meal")
 def log_meal(req: LogMealRequest):
