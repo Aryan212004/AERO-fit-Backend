@@ -1,3 +1,12 @@
+# Patch missing pkg_resources for razorpay on Render
+try:
+    import pkg_resources
+except ImportError:
+    import types, sys
+    pkg_resources = types.ModuleType("pkg_resources")
+    pkg_resources.get_distribution = lambda x: type("D", (), {"version": "0.0.0"})()
+    sys.modules["pkg_resources"] = pkg_resources
+    
 import os, sys, json, re, bcrypt, uuid, base64, traceback, threading, time, asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
