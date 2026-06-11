@@ -32,15 +32,13 @@ MONGO_URI          = _require("MONGO_URI")
 CLOUDINARY_CLOUD   = _require("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = _require("CLOUDINARY_API_KEY")
 CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
-SCAN_LIMIT         = int(os.environ.get("SCAN_LIMIT", "10"))
+RAZORPAY_KEY_ID     = _require("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = _require("RAZORPAY_KEY_SECRET")
 
-# ── Concurrency: cap simultaneous Gemini calls ────────────────────────────────
-# You're on Tier 1 Postpay → Gemini Flash Lite allows 4000 RPM.
-# Render is the real bottleneck. 50 concurrent Gemini threads is safe on Standard plan.
-# Each request that can't get a slot immediately queues in asyncio (no memory cost).
-# If it waits longer than SCAN_QUEUE_TIMEOUT_S seconds it gets a 503.
-MAX_CONCURRENT_SCANS   = int(os.environ.get("MAX_CONCURRENT_SCANS",   "50"))
-SCAN_QUEUE_TIMEOUT_S   = int(os.environ.get("SCAN_QUEUE_TIMEOUT_S",   "60"))   # max queue wait
+SCAN_LIMIT           = int(os.environ.get("SCAN_LIMIT",           "10"))
+MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "50"))
+SCAN_QUEUE_TIMEOUT_S = int(os.environ.get("SCAN_QUEUE_TIMEOUT_S", "60"))
+MAX_QUEUE_DEPTH      = int(os.environ.get("MAX_QUEUE_DEPTH",      "200"))
 
 ALPHA_USERNAME = os.environ.get("ALPHA_USERNAME", "superadmin").strip()
 ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
@@ -48,17 +46,14 @@ ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 PLATFORM_SHARE_PCT = 40
 GYM_SHARE_PCT      = 60
 
-RAZORPAY_KEY_ID     = _require("RAZORPAY_KEY_ID")
-RAZORPAY_KEY_SECRET = _require("RAZORPAY_KEY_SECRET")
- 
-INDIE_BASE_PRICE    = float(os.environ.get("INDIE_BASE_PRICE", "159"))   # ₹/month
-INDIE_DISCOUNT_PCT  = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month
- 
+INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/month
+INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month
+
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 print(f"✅  Razorpay configured → key {RAZORPAY_KEY_ID[:12]}…", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MONGODB INIT
+#  MONGODB
 # ══════════════════════════════════════════════════════════════════════════════
 
 from pymongo import MongoClient, DESCENDING
@@ -77,8 +72,11 @@ col_gyms:        Collection = mdb["platform_gyms"]
 col_gym_admins:  Collection = mdb["platform_gym_admins"]
 col_user_ids:    Collection = mdb["gym_user_ids"]
 col_invoices:    Collection = mdb["invoices"]
+col_payments:    Collection = mdb["indie_payments"]
 
+# ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
+col_users.create_index([("indie_plan", 1), ("indie_expires_at", 1)])  # for expiry job
 col_meals.create_index([("email", 1), ("logged_at", DESCENDING)])
 col_banners.create_index("created_at")
 col_banners.create_index([("gym_id", 1), ("created_at", DESCENDING)])
@@ -96,12 +94,10 @@ col_user_ids.create_index([("status", 1), ("expires_at", 1)])
 col_invoices.create_index([("gym_id", 1), ("created_at", DESCENDING)])
 col_invoices.create_index("invoice_id", unique=True)
 col_invoices.create_index("status")
-col_payments: Collection = mdb["indie_payments"]
 col_payments.create_index("order_id", unique=True)
 col_payments.create_index("payment_id")
 col_payments.create_index("email")
 col_payments.create_index([("email", 1), ("status", 1)])
- 
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -136,20 +132,9 @@ print(f"✅  Gemini ready → {GEMINI_MDL_PRIMARY}", flush=True)
 #  CONCURRENCY CONTROLS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Global semaphore: limits simultaneous Gemini calls server-wide.
-# Requests waiting for a slot sit in asyncio queue (zero CPU cost).
-# If a request waits longer than SCAN_QUEUE_TIMEOUT_S seconds, it gets 503.
-_gemini_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
-
-# Queue depth counter: how many requests are currently WAITING (not yet running).
-# Hard cap MAX_QUEUE_DEPTH: if queue is already this deep, reject immediately.
-# Protects against memory exhaustion when thousands pile up simultaneously.
-MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "200"))
-_queue_depth    = 0   # only mutated inside asyncio event loop, no lock needed
-
-# Per-user in-flight lock: prevents one user from queuing multiple scans
-_user_scan_locks: dict[str, asyncio.Lock] = {}
-_user_locks_meta: dict[str, float]        = {}
+_gemini_semaphore    = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+_user_scan_locks:    dict[str, asyncio.Lock] = {}
+_user_locks_meta:    dict[str, float]        = {}
 _locks_registry_lock = asyncio.Lock()
 
 async def _get_user_lock(email: str) -> asyncio.Lock:
@@ -170,7 +155,7 @@ async def _cleanup_stale_locks():
         if stale:
             print(f"🧹  Cleaned up {len(stale)} stale user lock(s)", flush=True)
 
-print(f"✅  Concurrency controls ready → {MAX_CONCURRENT_SCANS} active slots / {MAX_QUEUE_DEPTH} max queue depth", flush=True)
+print(f"✅  Concurrency controls ready → {MAX_CONCURRENT_SCANS} slots / {MAX_QUEUE_DEPTH} max queue depth", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BACKGROUND THREADS
@@ -190,18 +175,24 @@ def _keep_alive():
 
 
 def _run_expiry_job():
-    """Hourly job: expire memberships whose expires_at has passed."""
+    """
+    Hourly job — two tasks:
+      1. Expire gym memberships whose user-ID expires_at has passed.
+      2. Expire indie users whose indie_expires_at has passed.
+    """
     time.sleep(30)
     while True:
         try:
             now = datetime.now(timezone.utc)
+
+            # ── 1. Gym memberships ────────────────────────────────────────────
             expired_ids = list(col_user_ids.find({
                 "status":     "used",
                 "expires_at": {"$lte": now},
             }))
 
             if expired_ids:
-                print(f"⏰  Expiry job: processing {len(expired_ids)} expired User ID(s)", flush=True)
+                print(f"⏰  Expiry job: processing {len(expired_ids)} expired gym User ID(s)", flush=True)
 
             for uid_doc in expired_ids:
                 code    = uid_doc.get("code")
@@ -217,7 +208,7 @@ def _run_expiry_job():
                             "gym_id":                None,
                         }}
                     )
-                    print(f"   ↳ Expired user: {used_by}", flush=True)
+                    print(f"   ↳ Expired gym user: {used_by}", flush=True)
 
                 col_user_ids.delete_one({"gym_id": gym_id, "code": code})
                 col_gyms.update_one(
@@ -225,6 +216,26 @@ def _run_expiry_job():
                     {"$inc": {"members": -1}}
                 )
                 print(f"   ↳ Deleted User ID: {code} — gym: {gym_id}", flush=True)
+
+            # ── 2. Indie plan expirations ─────────────────────────────────────
+            expired_indie = list(col_users.find({
+                "indie_plan":         True,
+                "membership_expired": {"$ne": True},
+                "indie_expires_at":   {"$lte": now},
+            }))
+
+            if expired_indie:
+                print(f"⏰  Expiry job: processing {len(expired_indie)} expired indie user(s)", flush=True)
+
+            for u in expired_indie:
+                col_users.update_one(
+                    {"email": u["email"]},
+                    {"$set": {
+                        "membership_expired":    True,
+                        "membership_expired_at": now,
+                    }}
+                )
+                print(f"   ↳ Expired indie user: {u['email']}", flush=True)
 
         except Exception as e:
             print(f"⚠️  Expiry job error: {e}", flush=True)
@@ -240,11 +251,13 @@ print("✅  Background threads started (keep-alive + expiry job)", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="15.0.0")
+app = FastAPI(title="AERO-FIT API", version="16.0.0")
 
+# ── Add your deployed React dashboard URLs here ───────────────────────────────
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
     "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:3000",
+    # "https://your-admin-dashboard.vercel.app",  ← uncomment and add your URL
 ]
 
 app.add_middleware(
@@ -253,7 +266,7 @@ app.add_middleware(
     allow_credentials = False,
     allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers     = ["*"],
-    expose_headers    = ["*", "Retry-After"],   # expose Retry-After to Flutter
+    expose_headers    = ["*", "Retry-After"],
     max_age           = 3600,
 )
 
@@ -342,7 +355,7 @@ def upload_image(base64_str: str, folder: str, public_id: str = None) -> str:
     )
     return result.get("secure_url", "")
 
-def _ensure_utc(dt) -> datetime:
+def _ensure_utc(dt) -> Optional[datetime]:
     if dt is None:
         return None
     if isinstance(dt, datetime) and dt.tzinfo is None:
@@ -350,16 +363,16 @@ def _ensure_utc(dt) -> datetime:
     return dt
 
 def _check_and_increment_scan_limit(email: str) -> int:
-    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    filter = {"email": email, "date": today}
-    doc    = col_scan_limits.find_one(filter)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    query = {"email": email, "date": today}          # FIX: was 'filter' (shadows builtin)
+    doc   = col_scan_limits.find_one(query)
     if doc:
         count = doc.get("count", 0)
         if count >= SCAN_LIMIT:
             raise HTTPException(429, f"Daily scan limit reached ({SCAN_LIMIT}/day). Try again tomorrow!")
-        col_scan_limits.update_one(filter, {"$inc": {"count": 1}})
+        col_scan_limits.update_one(query, {"$inc": {"count": 1}})
         return SCAN_LIMIT - (count + 1)
-    col_scan_limits.insert_one({**filter, "count": 1})
+    col_scan_limits.insert_one({**query, "count": 1})
     return SCAN_LIMIT - 1
 
 def _generate_code() -> str:
@@ -368,24 +381,34 @@ def _generate_code() -> str:
 
 def _indie_pricing(months: int) -> dict:
     """
-    Base price ₹159/month.
-    Discount = months% off total (1 month = 0%, 2 months = 2%, …, 12 months = 12%).
+    Base ₹159/month.
+    Discount: (months-1)% off total — 1mo=0%, 2mo=1%, …, 12mo=11%.
     Returns amounts in paise (Razorpay uses paise).
     """
-    months        = max(1, min(months, 12))
-    discount_pct  = (months - 1) * INDIE_DISCOUNT_PCT   # 0% for 1 month, 1% for 2, …
-    gross_inr     = round(INDIE_BASE_PRICE * months, 2)
-    discount_inr  = round(gross_inr * discount_pct / 100, 2)
-    final_inr     = round(gross_inr - discount_inr, 2)
+    months       = max(1, min(months, 12))
+    discount_pct = (months - 1) * INDIE_DISCOUNT_PCT
+    gross_inr    = round(INDIE_BASE_PRICE * months, 2)
+    discount_inr = round(gross_inr * discount_pct / 100, 2)
+    final_inr    = round(gross_inr - discount_inr, 2)
     return {
-        "months":        months,
-        "base_price":    INDIE_BASE_PRICE,
-        "gross_inr":     gross_inr,
-        "discount_pct":  discount_pct,
-        "discount_inr":  discount_inr,
-        "final_inr":     final_inr,
-        "final_paise":   int(final_inr * 100),           # Razorpay needs paise
+        "months":       months,
+        "base_price":   INDIE_BASE_PRICE,
+        "gross_inr":    gross_inr,
+        "discount_pct": discount_pct,
+        "discount_inr": discount_inr,
+        "final_inr":    final_inr,
+        "final_paise":  int(final_inr * 100),
     }
+
+def _verify_hmac(order_id: str, payment_id: str, signature: str) -> bool:
+    """Verify Razorpay payment signature."""
+    msg      = f"{order_id}|{payment_id}"
+    expected = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        msg.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BILLING HELPERS
@@ -520,21 +543,27 @@ class InvoiceAlert(BaseModel):
 class UpdateUserIdPlan(BaseModel):
     plan_months: int
 
+# ── Indie (independent) payment models ───────────────────────────────────────
 class IndieOrderRequest(BaseModel):
-    """Step 1 — Flutter calls this before showing Razorpay checkout."""
-    months:     int    # 1–12
-    email:      str    # pending user email (not yet in DB)
-    name:       str
-    password:   str
-    weight_kg:  float
-    height_cm:  float
- 
+    """Step 1 — Flutter calls before showing Razorpay checkout."""
+    months:    int    # 1–12
+    email:     str
+    name:      str
+    password:  str
+    weight_kg: float
+    height_cm: float
+
 class IndieVerifyRequest(BaseModel):
-    """Step 2 — Flutter calls this after Razorpay returns success."""
+    """Step 2 — Flutter calls after Razorpay returns success."""
     razorpay_order_id:   str
     razorpay_payment_id: str
     razorpay_signature:  str
- 
+
+class IndieRenewOrderRequest(BaseModel):
+    """Renewal — existing indie user wants to extend plan."""
+    email:    str
+    password: str
+    months:   int  # 1–12
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -543,13 +572,12 @@ class IndieVerifyRequest(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status":          "ok",
-        "version":         "15.0.0",
-        "db":              "mongodb",
-        "ai":              GEMINI_MDL_PRIMARY,
-        "max_concurrent":  MAX_CONCURRENT_SCANS,
-        # Active scan count for monitoring dashboards
-        "active_scans":    MAX_CONCURRENT_SCANS - _gemini_semaphore._value,
+        "status":         "ok",
+        "version":        "16.0.0",
+        "db":             "mongodb",
+        "ai":             GEMINI_MDL_PRIMARY,
+        "max_concurrent": MAX_CONCURRENT_SCANS,
+        "active_scans":   MAX_CONCURRENT_SCANS - _gemini_semaphore._value,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -598,6 +626,11 @@ def platform_stats():
     pending_invoices = list(col_invoices.find({"status": {"$in": ["pending", "overdue"]}}))
     pending_amount   = sum(inv.get("gross", 0) for inv in pending_invoices)
 
+    # Indie revenue (paid Razorpay payments)
+    indie_payments  = list(col_payments.find({"status": "paid"}))
+    indie_revenue   = sum(p.get("amount_inr", 0) for p in indie_payments)
+    indie_users     = col_users.count_documents({"indie_plan": True, "membership_expired": {"$ne": True}})
+
     return {
         "total_gyms":       len(gyms),
         "active_gyms":      sum(1 for g in gyms if g.get("status") == "active"),
@@ -610,6 +643,8 @@ def platform_stats():
         "paid_invoices":    len(paid_invoices),
         "pending_invoices": len(pending_invoices),
         "overdue_invoices": sum(1 for inv in pending_invoices if inv.get("status") == "overdue"),
+        "indie_users":      indie_users,
+        "indie_revenue":    indie_revenue,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -673,7 +708,7 @@ def get_gym(gym_id: str):
     gym = col_gyms.find_one({"gym_id": gym_id})
     if not gym:
         raise HTTPException(404, "Gym not found")
-    gym = _doc(gym)
+    gym   = _doc(gym)
     admin = col_gym_admins.find_one({"gym_id": gym_id})
     if admin:
         admin = _doc(admin)
@@ -762,7 +797,7 @@ def delete_gym_admin(admin_id: str):
     return {"status": "deleted", "admin_id": admin_id}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — INVOICES
+#  ROUTES — INVOICES (super admin — manual gym billing)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/alpha/invoices")
@@ -949,9 +984,8 @@ def generate_user_ids(gym_id: str, req: GenerateUserIdsRequest):
     count       = max(1, req.count)
     plan_months = max(1, min(req.plan_months, 12))
     plan_label  = f"{plan_months} Month{'s' if plan_months > 1 else ''}"
-
-    codes = []
-    now   = datetime.now(timezone.utc)
+    codes       = []
+    now         = datetime.now(timezone.utc)
 
     for _ in range(count):
         for _attempt in range(10):
@@ -1027,11 +1061,15 @@ def update_user_id_plan(gym_id: str, code: str, req: UpdateUserIdPlan):
     return {"status": "updated", "code": code, "plan_months": plan_months, "plan_label": plan_label}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — USER MANAGEMENT
+#  ROUTES — USER MANAGEMENT (gym members — no payment needed)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/admin/add-user")
 def add_user(req: AddUserRequest):
+    """
+    Register a gym member using a User ID code.
+    Gym members do NOT pay — their gym pays the platform via manual invoicing.
+    """
     email = req.email.strip().lower()
     if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
         raise HTTPException(400, "Invalid email address")
@@ -1068,16 +1106,17 @@ def add_user(req: AddUserRequest):
 
     hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
     col_users.insert_one({
-        "email":               email,
-        "name":                req.name.strip(),
-        "password":            hashed,
-        "weight_kg":           req.weight_kg,
-        "height_cm":           req.height_cm,
-        "gym_id":              req.gym_id or None,
-        "plan_months":         plan_months,
-        "plan_label":          plan_label,
-        "membership_expired":  False,
-        "created_at":          datetime.now(timezone.utc),
+        "email":              email,
+        "name":               req.name.strip(),
+        "password":           hashed,
+        "weight_kg":          req.weight_kg,
+        "height_cm":          req.height_cm,
+        "gym_id":             req.gym_id or None,
+        "plan_months":        plan_months,
+        "plan_label":         plan_label,
+        "indie_plan":         False,
+        "membership_expired": False,
+        "created_at":         datetime.now(timezone.utc),
     })
     return {"status": "created", "email": email, "plan_months": plan_months, "plan_label": plan_label}
 
@@ -1091,6 +1130,7 @@ def list_users():
             "weight_kg":          d["weight_kg"],
             "height_cm":          d["height_cm"],
             "gym_id":             d.get("gym_id"),
+            "indie_plan":         d.get("indie_plan", False),
             "plan_months":        d.get("plan_months", 1),
             "plan_label":         d.get("plan_label", "1 Month"),
             "membership_expired": d.get("membership_expired", False),
@@ -1119,8 +1159,24 @@ def user_login(req: UserLogin):
     if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
         raise HTTPException(401, "Invalid email or password")
 
+    # Already flagged as expired in DB
     if user.get("membership_expired"):
         raise HTTPException(403, "membership_expired")
+
+    now = datetime.now(timezone.utc)
+
+    # ── Check indie plan expiry ───────────────────────────────────────────────
+    if user.get("indie_plan") and user.get("indie_expires_at"):
+        indie_exp = _ensure_utc(user["indie_expires_at"])
+        if indie_exp and indie_exp <= now:
+            col_users.update_one(
+                {"email": email},
+                {"$set": {
+                    "membership_expired":    True,
+                    "membership_expired_at": now,
+                }}
+            )
+            raise HTTPException(403, "membership_expired")
 
     gym_name = ""
     if user.get("gym_id"):
@@ -1129,20 +1185,26 @@ def user_login(req: UserLogin):
             gym_name = gym.get("name", "")
 
     membership_expires = None
+
+    # ── Check gym membership expiry ───────────────────────────────────────────
     if user.get("gym_id"):
         uid_doc = col_user_ids.find_one({"used_by": email, "gym_id": user["gym_id"]})
         if uid_doc and uid_doc.get("expires_at"):
-            if _ensure_utc(uid_doc["expires_at"]) <= datetime.now(timezone.utc):
+            if _ensure_utc(uid_doc["expires_at"]) <= now:
                 col_users.update_one(
                     {"email": email},
                     {"$set": {
                         "membership_expired":    True,
-                        "membership_expired_at": datetime.now(timezone.utc),
+                        "membership_expired_at": now,
                         "gym_id":                None,
                     }}
                 )
                 raise HTTPException(403, "membership_expired")
             membership_expires = _fmt_dt(uid_doc["expires_at"])
+
+    # ── indie_expires_at as membership_expires for indie users ────────────────
+    if user.get("indie_plan") and user.get("indie_expires_at") and not membership_expires:
+        membership_expires = _fmt_dt(user["indie_expires_at"])
 
     return {
         "status": "ok",
@@ -1153,6 +1215,7 @@ def user_login(req: UserLogin):
             "height_cm":          user["height_cm"],
             "gym_id":             user.get("gym_id"),
             "gym_name":           gym_name,
+            "indie_plan":         user.get("indie_plan", False),
             "plan_months":        user.get("plan_months", 1),
             "plan_label":         user.get("plan_label", "1 Month"),
             "membership_expired": False,
@@ -1165,6 +1228,7 @@ def get_user(email: str):
     user = col_users.find_one({"email": email.lower()})
     if not user:
         raise HTTPException(404, "User not found")
+
     gym_name = ""
     if user.get("gym_id"):
         gym = col_gyms.find_one({"gym_id": user["gym_id"]})
@@ -1172,10 +1236,14 @@ def get_user(email: str):
             gym_name = gym.get("name", "")
 
     membership_expires = None
+
     if user.get("gym_id"):
         uid_doc = col_user_ids.find_one({"used_by": email.lower(), "gym_id": user["gym_id"]})
         if uid_doc and uid_doc.get("expires_at"):
             membership_expires = _fmt_dt(uid_doc["expires_at"])
+
+    if user.get("indie_plan") and user.get("indie_expires_at") and not membership_expires:
+        membership_expires = _fmt_dt(user["indie_expires_at"])
 
     return {
         "email":              user["email"],
@@ -1184,6 +1252,7 @@ def get_user(email: str):
         "height_cm":          user["height_cm"],
         "gym_id":             user.get("gym_id"),
         "gym_name":           gym_name,
+        "indie_plan":         user.get("indie_plan", False),
         "plan_months":        user.get("plan_months", 1),
         "plan_label":         user.get("plan_label", "1 Month"),
         "membership_expired": user.get("membership_expired", False),
@@ -1203,7 +1272,7 @@ def update_user(email: str, req: UserUpdate):
     return {"status": "updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — MEMBERSHIP STATUS
+#  ROUTES — MEMBERSHIP STATUS (polled by Flutter MembershipService)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/user/{email}/membership-status")
@@ -1213,6 +1282,7 @@ def membership_status(email: str):
     if not user:
         raise HTTPException(404, "User not found")
 
+    # Already flagged
     if user.get("membership_expired"):
         return {
             "valid":      False,
@@ -1220,15 +1290,36 @@ def membership_status(email: str):
             "expired_at": _fmt_dt(user.get("membership_expired_at")),
         }
 
+    now = datetime.now(timezone.utc)
+
+    # ── Indie plan expiry check ───────────────────────────────────────────────
+    if user.get("indie_plan") and user.get("indie_expires_at"):
+        indie_exp = _ensure_utc(user["indie_expires_at"])
+        if indie_exp and indie_exp <= now:
+            col_users.update_one(
+                {"email": email},
+                {"$set": {
+                    "membership_expired":    True,
+                    "membership_expired_at": now,
+                }}
+            )
+            return {
+                "valid":      False,
+                "reason":     "expired",
+                "expired_at": _fmt_dt(indie_exp),
+            }
+        return {
+            "valid":      True,
+            "reason":     "active",
+            "expires_at": _fmt_dt(indie_exp),
+        }
+
+    # ── No gym → free user, always valid ─────────────────────────────────────
     if not user.get("gym_id"):
         return {"valid": True, "reason": "no_gym"}
 
-    uid_doc = col_user_ids.find_one({
-        "used_by": email,
-        "gym_id":  user["gym_id"],
-    })
-
-    now = datetime.now(timezone.utc)
+    # ── Gym membership expiry check ───────────────────────────────────────────
+    uid_doc = col_user_ids.find_one({"used_by": email, "gym_id": user["gym_id"]})
 
     if uid_doc:
         expires_at = uid_doc.get("expires_at")
@@ -1294,20 +1385,16 @@ def list_banners(gym_id: str, screen: str = None):
 def delete_banner(gym_id: str, banner_id: str):
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
-
     banner = col_banners.find_one({"banner_id": banner_id, "gym_id": gym_id})
     if not banner:
         raise HTTPException(404, "Banner not found or belongs to a different gym")
-
     image_url = banner.get("image_url", "")
     if image_url:
         try:
-            public_id = f"aerofitdb/banners/{banner_id}"
-            cloudinary.uploader.destroy(public_id, resource_type="image")
-            print(f"✅  Cloudinary image deleted → {public_id}", flush=True)
+            cloudinary.uploader.destroy(f"aerofitdb/banners/{banner_id}", resource_type="image")
+            print(f"✅  Cloudinary image deleted → aerofitdb/banners/{banner_id}", flush=True)
         except Exception as e:
-            print(f"⚠️  Cloudinary delete failed for {banner_id}: {e}", flush=True)
-
+            print(f"⚠️  Cloudinary delete failed: {e}", flush=True)
     col_banners.delete_one({"banner_id": banner_id, "gym_id": gym_id})
     return {"status": "deleted"}
 
@@ -1368,20 +1455,18 @@ def get_scan_limit(email: str):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — MEALS  (async for semaphore compatibility)
+#  ROUTES — MEALS
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/analyze-meal")
 async def analyze_meal(req: MealRequest):
     """
     Concurrency-safe meal analysis:
-      1. Per-user lock  → rejects a second scan from the same user while one is running
-      2. Global semaphore → caps total simultaneous Gemini calls; returns 503 if full
-    Both controls are released immediately after the Gemini call completes.
+      1. Per-user lock  → rejects duplicate scan from same user
+      2. Global semaphore → caps total simultaneous Gemini calls
     """
     email = req.email.strip().lower() if req.email else ""
 
-    # ── 1. Per-user lock ──────────────────────────────────────────────────────
     user_lock = await _get_user_lock(email) if email else None
 
     if user_lock and user_lock.locked():
@@ -1391,9 +1476,8 @@ async def analyze_meal(req: MealRequest):
         )
 
     async def _run_analysis():
-        # ── 2. Global Gemini semaphore ────────────────────────────────────────
-        if _gemini_semaphore.locked() and _gemini_semaphore._value == 0:
-            # All slots full — tell client to retry in ~10 seconds
+        # FIX: asyncio.Semaphore has no .locked() — use ._value directly
+        if _gemini_semaphore._value == 0:
             return JSONResponse(
                 status_code=503,
                 content={"detail": "Server is busy. Please try again shortly."},
@@ -1402,8 +1486,6 @@ async def analyze_meal(req: MealRequest):
 
         try:
             async with _gemini_semaphore:
-                # Scan limit check (must happen after we've acquired the semaphore
-                # to ensure the count update is atomic with the Gemini call)
                 remaining = 0
                 if email:
                     try:
@@ -1416,7 +1498,6 @@ async def analyze_meal(req: MealRequest):
                             )
                         raise
 
-                # Run Gemini in a thread pool (it's a sync call)
                 image_part = _b64_to_part(req.image_base64)
                 prompt = (
                     "Estimate nutrition for the EXACT portion shown. Return ONLY JSON:\n"
@@ -1428,7 +1509,7 @@ async def analyze_meal(req: MealRequest):
                     lambda: _ask_gemini([image_part], prompt),
                 )
 
-                d = _extract_json(text)
+                d      = _extract_json(text)
                 result = {
                     "name":            str(d.get("name",         "Meal")),
                     "serving_size":    str(d.get("serving_size", "1 serving")),
@@ -1441,9 +1522,11 @@ async def analyze_meal(req: MealRequest):
                     "scans_remaining": remaining,
                 }
 
-                print(f"✅  Scan → {email or 'anon'}  {result['name']}  {result['kcal']} kcal  "
-                      f"[{MAX_CONCURRENT_SCANS - _gemini_semaphore._value}/{MAX_CONCURRENT_SCANS} slots]",
-                      flush=True)
+                print(
+                    f"✅  Scan → {email or 'anon'}  {result['name']}  {result['kcal']} kcal  "
+                    f"[{MAX_CONCURRENT_SCANS - _gemini_semaphore._value}/{MAX_CONCURRENT_SCANS} slots]",
+                    flush=True,
+                )
                 return result
 
         except HTTPException:
@@ -1458,7 +1541,6 @@ async def analyze_meal(req: MealRequest):
     else:
         result = await _run_analysis()
 
-    # Periodic lock cleanup (every ~100 requests, non-blocking)
     if hash(email) % 100 == 0:
         asyncio.create_task(_cleanup_stale_locks())
 
@@ -1510,53 +1592,65 @@ def delete_meal(meal_id: str):
         raise HTTPException(404, "Meal not found")
     return {"status": "deleted"}
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — INDIE PLAN (Razorpay — independent users only)
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/indie/pricing/{months}")
 def indie_pricing(months: int):
-    """Preview pricing for N months — called while user is selecting plan."""
+    """Preview pricing for N months — called while user selects a plan."""
     if months < 1 or months > 12:
         raise HTTPException(400, "months must be 1–12")
     return _indie_pricing(months)
- 
- 
+
+
 @app.post("/indie/create-order")
 def indie_create_order(req: IndieOrderRequest):
     """
-    Creates a Razorpay order and stores a pending payment record.
-    Flutter opens Razorpay checkout with the returned order_id + key_id.
-    The user is NOT registered yet — registration happens only after payment.
+    Step 1 of indie signup:
+    Creates a Razorpay order. The user is NOT registered yet.
+    Registration happens only after payment is verified.
     """
     email = req.email.strip().lower()
     if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
         raise HTTPException(400, "Invalid email address")
     if col_users.find_one({"email": email}):
         raise HTTPException(409, "An account with this email already exists")
- 
+
+    # Guard: don't create duplicate pending orders for the same email
+    existing_pending = col_payments.find_one({"email": email, "status": "pending"})
+    if existing_pending:
+        pricing = _indie_pricing(existing_pending["months"])
+        return {
+            "order_id":        existing_pending["order_id"],
+            "key_id":          RAZORPAY_KEY_ID,
+            "amount":          existing_pending["amount_paise"],
+            "currency":        "INR",
+            "name":            "AERO-FIT",
+            "description":     f"{existing_pending['months']} Month — Independent Plan",
+            "prefill_email":   email,
+            "prefill_name":    existing_pending["name"],
+            **pricing,
+        }
+
     months  = max(1, min(req.months, 12))
     pricing = _indie_pricing(months)
     now     = datetime.now(timezone.utc)
- 
-    # Create Razorpay order
+
     try:
         rp_order = razorpay_client.order.create({
             "amount":   pricing["final_paise"],
             "currency": "INR",
             "receipt":  f"indie_{email[:20]}_{now.strftime('%Y%m%d%H%M%S')}",
-            "notes": {
-                "email":  email,
-                "months": str(months),
-                "app":    "aerofit",
-            },
+            "notes":    {"email": email, "months": str(months), "app": "aerofit"},
         })
     except Exception as e:
         print(f"❌  Razorpay order creation failed: {e}", flush=True)
         raise HTTPException(502, "Payment gateway error. Please try again.")
- 
-    order_id = rp_order["id"]
- 
-    # Persist pending record (includes encrypted password for post-payment registration)
+
+    order_id  = rp_order["id"]
     hashed_pw = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
- 
+
     col_payments.insert_one({
         "order_id":     order_id,
         "payment_id":   None,
@@ -1570,78 +1664,67 @@ def indie_create_order(req: IndieOrderRequest):
         "amount_paise": pricing["final_paise"],
         "discount_pct": pricing["discount_pct"],
         "status":       "pending",
+        "type":         "new",
         "created_at":   now,
         "verified_at":  None,
     })
- 
+
     print(f"✅  Indie order created → {order_id}  {email}  {months}mo  ₹{pricing['final_inr']}", flush=True)
     return {
-        "order_id":   order_id,
-        "key_id":     RAZORPAY_KEY_ID,
-        "amount":     pricing["final_paise"],
-        "currency":   "INR",
-        "name":       "AERO-FIT",
-        "description": f"{months} Month{'s' if months > 1 else ''} — Independent Plan",
+        "order_id":      order_id,
+        "key_id":        RAZORPAY_KEY_ID,
+        "amount":        pricing["final_paise"],
+        "currency":      "INR",
+        "name":          "AERO-FIT",
+        "description":   f"{months} Month{'s' if months > 1 else ''} — Independent Plan",
         "prefill_email": email,
         "prefill_name":  req.name.strip(),
         **pricing,
     }
- 
- 
+
+
 @app.post("/indie/verify-payment")
 def indie_verify_payment(req: IndieVerifyRequest):
     """
-    1. Verifies Razorpay HMAC signature (prevents spoofing).
-    2. Registers the user account.
-    3. Sets membership plan_months + expires_at.
-    4. Returns user object so Flutter can auto-login.
+    Step 2 of indie signup:
+    Verifies Razorpay HMAC → registers user → sets indie_expires_at.
+    Returns user object so Flutter can auto-login.
     """
-    # ── 1. HMAC signature check ────────────────────────────────────────────────
-    msg       = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected  = hmac.new(
-        RAZORPAY_KEY_SECRET.encode(),
-        msg.encode(),
-        hashlib.sha256,
-    ).hexdigest()
- 
-    if not hmac.compare_digest(expected, req.razorpay_signature):
+    if not _verify_hmac(req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature):
         raise HTTPException(400, "Payment verification failed. Signature mismatch.")
- 
-    # ── 2. Find the pending order ──────────────────────────────────────────────
+
     pending = col_payments.find_one({
         "order_id": req.razorpay_order_id,
         "status":   "pending",
+        "type":     "new",
     })
     if not pending:
         raise HTTPException(404, "Order not found or already processed")
- 
+
     email  = pending["email"]
     months = pending["months"]
     now    = datetime.now(timezone.utc)
- 
-    # ── 3. Guard: user might have registered via another flow in the meantime ──
+
     if col_users.find_one({"email": email}):
         raise HTTPException(409, "Account already exists for this email")
- 
-    # ── 4. Register user ───────────────────────────────────────────────────────
+
     expires_at = now + timedelta(days=30 * months)
- 
+
     col_users.insert_one({
-        "email":               email,
-        "name":                pending["name"],
-        "password":            pending["password"],   # already bcrypt-hashed
-        "weight_kg":           pending["weight_kg"],
-        "height_cm":           pending["height_cm"],
-        "gym_id":              None,
-        "plan_months":         months,
-        "plan_label":          f"{months} Month{'s' if months > 1 else ''}",
-        "indie_plan":          True,
-        "indie_expires_at":    expires_at,
-        "membership_expired":  False,
-        "created_at":          now,
+        "email":              email,
+        "name":               pending["name"],
+        "password":           pending["password"],  # already bcrypt-hashed
+        "weight_kg":          pending["weight_kg"],
+        "height_cm":          pending["height_cm"],
+        "gym_id":             None,
+        "plan_months":        months,
+        "plan_label":         f"{months} Month{'s' if months > 1 else ''}",
+        "indie_plan":         True,
+        "indie_expires_at":   expires_at,
+        "membership_expired": False,
+        "created_at":         now,
     })
- 
-    # ── 5. Mark payment as verified ───────────────────────────────────────────
+
     col_payments.update_one(
         {"order_id": req.razorpay_order_id},
         {"$set": {
@@ -1650,8 +1733,8 @@ def indie_verify_payment(req: IndieVerifyRequest):
             "verified_at": now,
         }},
     )
- 
-    print(f"✅  Payment verified → {email}  {months}mo  ₹{pending['amount_inr']}  pid={req.razorpay_payment_id}", flush=True)
+
+    print(f"✅  Indie payment verified → {email}  {months}mo  ₹{pending['amount_inr']}  pid={req.razorpay_payment_id}", flush=True)
     return {
         "status": "ok",
         "user": {
@@ -1661,27 +1744,152 @@ def indie_verify_payment(req: IndieVerifyRequest):
             "height_cm":          pending["height_cm"],
             "gym_id":             None,
             "gym_name":           "",
+            "indie_plan":         True,
             "plan_months":        months,
             "plan_label":         f"{months} Month{'s' if months > 1 else ''}",
-            "indie_plan":         True,
             "indie_expires_at":   expires_at.isoformat(),
             "membership_expired": False,
             "membership_expires": expires_at.isoformat(),
         },
     }
- 
- 
+
+
+@app.post("/indie/create-renewal-order")
+def indie_create_renewal_order(req: IndieRenewOrderRequest):
+    """
+    Step 1 of indie renewal:
+    Existing indie user wants to extend their plan.
+    Verifies identity first, then creates a new Razorpay order.
+    """
+    email = req.email.strip().lower()
+    user  = col_users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+    if not user.get("indie_plan"):
+        raise HTTPException(400, "Only independent plan users can renew here")
+    if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
+        raise HTTPException(401, "Invalid password")
+
+    months  = max(1, min(req.months, 12))
+    pricing = _indie_pricing(months)
+    now     = datetime.now(timezone.utc)
+
+    try:
+        rp_order = razorpay_client.order.create({
+            "amount":   pricing["final_paise"],
+            "currency": "INR",
+            "receipt":  f"renew_{email[:20]}_{now.strftime('%Y%m%d%H%M%S')}",
+            "notes":    {"email": email, "months": str(months), "type": "renewal"},
+        })
+    except Exception as e:
+        print(f"❌  Razorpay renewal order creation failed: {e}", flush=True)
+        raise HTTPException(502, "Payment gateway error. Please try again.")
+
+    order_id = rp_order["id"]
+
+    col_payments.insert_one({
+        "order_id":     order_id,
+        "payment_id":   None,
+        "email":        email,
+        "name":         user["name"],
+        "password":     None,     # not needed — user already exists
+        "weight_kg":    user["weight_kg"],
+        "height_cm":    user["height_cm"],
+        "months":       months,
+        "amount_inr":   pricing["final_inr"],
+        "amount_paise": pricing["final_paise"],
+        "discount_pct": pricing["discount_pct"],
+        "status":       "pending",
+        "type":         "renewal",
+        "created_at":   now,
+        "verified_at":  None,
+    })
+
+    print(f"✅  Renewal order created → {order_id}  {email}  {months}mo  ₹{pricing['final_inr']}", flush=True)
+    return {
+        "order_id":      order_id,
+        "key_id":        RAZORPAY_KEY_ID,
+        "amount":        pricing["final_paise"],
+        "currency":      "INR",
+        "name":          "AERO-FIT",
+        "description":   f"Renewal — {months} Month{'s' if months > 1 else ''}",
+        "prefill_email": email,
+        "prefill_name":  user["name"],
+        **pricing,
+    }
+
+
+@app.post("/indie/verify-renewal")
+def indie_verify_renewal(req: IndieVerifyRequest):
+    """
+    Step 2 of indie renewal:
+    Verifies HMAC → extends indie_expires_at from current expiry (or now if already expired).
+    """
+    if not _verify_hmac(req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature):
+        raise HTTPException(400, "Payment verification failed. Signature mismatch.")
+
+    pending = col_payments.find_one({
+        "order_id": req.razorpay_order_id,
+        "status":   "pending",
+        "type":     "renewal",
+    })
+    if not pending:
+        raise HTTPException(404, "Renewal order not found or already processed")
+
+    email  = pending["email"]
+    months = pending["months"]
+    now    = datetime.now(timezone.utc)
+
+    user = col_users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    # Extend from current expiry if still in the future, else extend from now
+    current_exp = _ensure_utc(user.get("indie_expires_at"))
+    base        = current_exp if (current_exp and current_exp > now) else now
+    new_exp     = base + timedelta(days=30 * months)
+
+    col_users.update_one(
+        {"email": email},
+        {"$set": {
+            "indie_expires_at":   new_exp,
+            "membership_expired": False,
+            "plan_months":        months,
+            "plan_label":         f"{months} Month{'s' if months > 1 else ''}",
+        }}
+    )
+
+    col_payments.update_one(
+        {"order_id": req.razorpay_order_id},
+        {"$set": {
+            "payment_id":  req.razorpay_payment_id,
+            "status":      "paid",
+            "verified_at": now,
+        }},
+    )
+
+    print(f"✅  Renewal verified → {email}  {months}mo  new expiry: {new_exp.isoformat()}  pid={req.razorpay_payment_id}", flush=True)
+    return {
+        "status":          "renewed",
+        "email":           email,
+        "months":          months,
+        "new_expires_at":  new_exp.isoformat(),
+        "membership_expires": new_exp.isoformat(),
+    }
+
+
 @app.get("/indie/payment-status/{order_id}")
 def indie_payment_status(order_id: str):
-    """Lets Flutter poll for payment status (useful for webhook fallback)."""
+    """Flutter polls this to check payment status (fallback for dropped connections)."""
     doc = col_payments.find_one({"order_id": order_id})
     if not doc:
         raise HTTPException(404, "Order not found")
     return {
-        "order_id":  order_id,
-        "status":    doc.get("status"),
-        "email":     doc.get("email"),
-        "months":    doc.get("months"),
+        "order_id":   order_id,
+        "status":     doc.get("status"),
+        "type":       doc.get("type", "new"),
+        "email":      doc.get("email"),
+        "months":     doc.get("months"),
         "amount_inr": doc.get("amount_inr"),
     }
 
