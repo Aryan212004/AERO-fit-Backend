@@ -1651,7 +1651,7 @@ def indie_create_order(req: IndieOrderRequest):
         rp_order = razorpay_client.order.create({
             "amount":   pricing["final_paise"],
             "currency": "INR",
-            "receipt":  f"indie_{email[:20]}_{now.strftime('%Y%m%d%H%M%S')}",
+            "receipt":  f"af_{email[:12]}_{now.strftime('%m%d%H%M%S')}",
             "notes":    {"email": email, "months": str(months), "app": "aerofit"},
         })
     except Exception as e:
@@ -1788,7 +1788,7 @@ def indie_create_renewal_order(req: IndieRenewOrderRequest):
         rp_order = razorpay_client.order.create({
             "amount":   pricing["final_paise"],
             "currency": "INR",
-            "receipt":  f"renew_{email[:20]}_{now.strftime('%Y%m%d%H%M%S')}",
+            "receipt":  f"rn_{email[:12]}_{now.strftime('%m%d%H%M%S')}",
             "notes":    {"email": email, "months": str(months), "type": "renewal"},
         })
     except Exception as e:
