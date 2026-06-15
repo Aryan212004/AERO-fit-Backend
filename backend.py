@@ -7,7 +7,7 @@ except ImportError:
     pkg_resources.get_distribution = lambda x: type("D", (), {"version": "0.0.0"})()
     pkg_resources.DistributionNotFound = Exception
     sys.modules["pkg_resources"] = pkg_resources
-    
+
 import os, sys, json, re, bcrypt, uuid, base64, traceback, threading, time, asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -18,6 +18,9 @@ from pydantic import BaseModel
 import razorpay
 import hmac
 import hashlib
+import requests as http_requests
+import google.auth.transport.requests
+from google.oauth2 import service_account
 
 # ── Load .env for local dev (no-op on Render) ─────────────────────────────────
 try:
@@ -44,6 +47,9 @@ CLOUDINARY_API_KEY = _require("CLOUDINARY_API_KEY")
 CLOUDINARY_SECRET  = _require("CLOUDINARY_API_SECRET")
 RAZORPAY_KEY_ID     = _require("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = _require("RAZORPAY_KEY_SECRET")
+
+FIREBASE_PROJECT_ID  = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
+FIREBASE_CREDS_PATH  = "/etc/secrets/firebase-service-account.json"
 
 SCAN_LIMIT           = int(os.environ.get("SCAN_LIMIT",           "10"))
 MAX_CONCURRENT_SCANS = int(os.environ.get("MAX_CONCURRENT_SCANS", "50"))
@@ -261,7 +267,7 @@ print("✅  Background threads started (keep-alive + expiry job)", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="16.1.0")
+app = FastAPI(title="AERO-FIT API", version="17.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -513,6 +519,75 @@ def _cascade_delete_gym(gym_id: str) -> dict:
     return summary
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FCM PUSH SENDER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _send_fcm_push(gym_id: str, title: str, body: str, data: dict = {}):
+    """
+    Sends OS-level push notification to all devices subscribed
+    to topic gym_{gym_id}. Works when app is fully closed.
+    """
+    try:
+        if not FIREBASE_PROJECT_ID:
+            print("⚠️  FIREBASE_PROJECT_ID not set — skipping push", flush=True)
+            return
+        if not os.path.exists(FIREBASE_CREDS_PATH):
+            print(f"⚠️  Firebase creds not found at {FIREBASE_CREDS_PATH}", flush=True)
+            return
+
+        creds = service_account.Credentials.from_service_account_file(
+            FIREBASE_CREDS_PATH,
+            scopes=["https://www.googleapis.com/auth/firebase.messaging"],
+        )
+        creds.refresh(google.auth.transport.requests.Request())
+
+        resp = http_requests.post(
+            f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send",
+            headers={
+                "Authorization": f"Bearer {creds.token}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "message": {
+                    "topic": f"gym_{gym_id}",
+                    "notification": {
+                        "title": title,
+                        "body":  body,
+                    },
+                    "data": {k: str(v) for k, v in data.items()},
+                    "android": {
+                        "priority": "high",
+                        "notification": {
+                            "channel_id":           "aerofit_channel",
+                            "default_sound":        True,
+                            "notification_priority": "PRIORITY_HIGH",
+                        },
+                    },
+                    "apns": {
+                        "headers": {"apns-priority": "10"},
+                        "payload": {
+                            "aps": {
+                                "sound":             "default",
+                                "badge":             1,
+                                "content-available": 1,
+                            }
+                        },
+                    },
+                }
+            },
+            timeout=10,
+        )
+
+        result = resp.json()
+        if resp.status_code == 200:
+            print(f"✅  FCM push sent → gym={gym_id}  title='{title}'", flush=True)
+        else:
+            print(f"⚠️  FCM error {resp.status_code}: {result}", flush=True)
+
+    except Exception as e:
+        print(f"⚠️  FCM push failed: {e}", flush=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  PYDANTIC MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -624,6 +699,10 @@ class InvoiceAlert(BaseModel):
 class UpdateUserIdPlan(BaseModel):
     plan_months: int
 
+class FcmTokenUpdate(BaseModel):
+    fcm_token: str
+    gym_id:    str
+
 # ── Indie (independent) payment models ───────────────────────────────────────
 class IndieOrderRequest(BaseModel):
     months:    int
@@ -651,7 +730,7 @@ class IndieRenewOrderRequest(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "16.1.0",
+        "version":        "17.0.0",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -809,7 +888,7 @@ def update_gym(gym_id: str, req: GymUpdate):
     return {"status": "updated", "gym_id": gym_id}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NEW: Gym deletion preview — returns counts before actual deletion
+#  Gym deletion preview — returns counts before actual deletion
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/alpha/gyms/{gym_id}/delete-preview")
@@ -834,19 +913,19 @@ def gym_delete_preview(gym_id: str):
     meal_count     = col_meals.count_documents({"email": {"$in": member_emails}}) if member_emails else 0
 
     return {
-        "gym_id":       gym_id,
-        "gym_name":     gym.get("name", ""),
-        "members":      member_count,
-        "meals":        meal_count,
-        "user_ids":     user_id_count,
-        "invoices":     invoice_count,
-        "banners":      banner_count,
+        "gym_id":        gym_id,
+        "gym_name":      gym.get("name", ""),
+        "members":       member_count,
+        "meals":         meal_count,
+        "user_ids":      user_id_count,
+        "invoices":      invoice_count,
+        "banners":       banner_count,
         "notifications": notif_count,
-        "admins":       admin_count,
+        "admins":        admin_count,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  UPDATED: Gym deletion — full cascade
+#  Gym deletion — full cascade
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.delete("/alpha/gyms/{gym_id}")
@@ -1392,6 +1471,21 @@ def update_user(email: str, req: UserUpdate):
     return {"status": "updated"}
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — FCM TOKEN
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/user/{email}/fcm-token")
+def update_fcm_token(email: str, req: FcmTokenUpdate):
+    col_users.update_one(
+        {"email": email.lower()},
+        {"$set": {
+            "fcm_token":  req.fcm_token,
+            "updated_at": datetime.now(timezone.utc),
+        }}
+    )
+    return {"status": "ok"}
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — MEMBERSHIP STATUS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1515,7 +1609,7 @@ def delete_banner(gym_id: str, banner_id: str):
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — NOTIFICATIONS
+#  ROUTES — NOTIFICATIONS (with FCM push)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/gym/{gym_id}/notifications")
@@ -1524,6 +1618,7 @@ def create_notification(gym_id: str, req: NotificationCreate):
         raise HTTPException(404, "Gym not found")
     if req.gym_id != gym_id:
         raise HTTPException(403, "Cannot create notifications for a different gym")
+
     notif_id = str(uuid.uuid4())
     col_notifs.insert_one({
         "notification_id": notif_id,
@@ -1536,6 +1631,19 @@ def create_notification(gym_id: str, req: NotificationCreate):
         "scheduled_at":    req.scheduled_at or "",
         "sent_at":         datetime.now(timezone.utc),
     })
+
+    # ── Fire FCM push in background — API responds instantly ─────────────────
+    threading.Thread(
+        target=_send_fcm_push,
+        args=(gym_id, req.title, req.body),
+        kwargs={"data": {
+            "type":     req.type,
+            "gym_id":   gym_id,
+            "notif_id": notif_id,
+        }},
+        daemon=True,
+    ).start()
+
     return {"status": "sent", "notification_id": notif_id}
 
 @app.get("/gym/{gym_id}/notifications")
