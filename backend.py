@@ -17,6 +17,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import razorpay
 import hmac
+import random
+import resend
 import hashlib
 import requests as http_requests
 import google.auth.transport.requests
@@ -68,6 +70,15 @@ INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 print(f"✅  Razorpay configured → key {RAZORPAY_KEY_ID[:12]}…", flush=True)
 
+RESEND_API_KEY  = _require("RESEND_API_KEY")
+RESEND_FROM     = os.environ.get("RESEND_FROM", "AERO-FIT <onboarding@resend.dev>").strip()
+ 
+resend.api_key = RESEND_API_KEY
+ 
+OTP_EXPIRY_MINUTES        = int(os.environ.get("OTP_EXPIRY_MINUTES", "10"))
+OTP_MAX_ATTEMPTS          = int(os.environ.get("OTP_MAX_ATTEMPTS", "5"))
+RESET_TOKEN_EXPIRY_MINUTES = int(os.environ.get("RESET_TOKEN_EXPIRY_MINUTES", "15"))
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONGODB
 # ══════════════════════════════════════════════════════════════════════════════
@@ -89,6 +100,7 @@ col_gym_admins:  Collection = mdb["platform_gym_admins"]
 col_user_ids:    Collection = mdb["gym_user_ids"]
 col_invoices:    Collection = mdb["invoices"]
 col_payments:    Collection = mdb["indie_payments"]
+col_password_resets: Collection = mdb["password_resets"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
@@ -114,6 +126,8 @@ col_payments.create_index("order_id", unique=True)
 col_payments.create_index("payment_id")
 col_payments.create_index("email")
 col_payments.create_index([("email", 1), ("status", 1)])
+col_password_resets.create_index("email")
+col_password_resets.create_index("expires_at")
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -587,6 +601,46 @@ def _send_fcm_push(gym_id: str, title: str, body: str, data: dict = {}):
     except Exception as e:
         print(f"⚠️  FCM push failed: {e}", flush=True)
 
+def _generate_otp() -> str:
+    return f"{random.randint(0, 999999):06d}"
+ 
+ 
+def _send_otp_email(to_email: str, name: str, otp: str) -> bool:
+    """
+    Sends the OTP email via Resend. Returns True on success.
+    Swap this function's body if you switch email providers later —
+    nothing else in the codebase needs to change.
+    """
+    try:
+        resend.Emails.send({
+            "from":    RESEND_FROM,
+            "to":      [to_email],
+            "subject": f"Your AERO-FIT password reset code: {otp}",
+            "html": f"""
+                <div style="font-family: -apple-system, Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
+                    <h2 style="color:#0A1628; margin-bottom: 4px;">AERO<span style="color:#2A5FD4;">-FIT</span></h2>
+                    <p style="color:#3A5A8A; font-size: 15px;">Hi {name or 'there'},</p>
+                    <p style="color:#3A5A8A; font-size: 15px;">
+                        Use the code below to reset your password. It expires in {OTP_EXPIRY_MINUTES} minutes.
+                    </p>
+                    <div style="background:#F0F6FF; border-radius:12px; padding:18px; text-align:center; margin: 20px 0;">
+                        <span style="font-size: 32px; font-weight: 800; letter-spacing: 6px; color:#0A1628;">{otp}</span>
+                    </div>
+                    <p style="color:#8AAAD0; font-size: 13px;">
+                        If you didn't request this, you can safely ignore this email.
+                    </p>
+                </div>
+            """,
+        })
+        return True
+    except Exception as e:
+        print(f"⚠️  Failed to send OTP email to {to_email}: {e}", flush=True)
+        return False
+ 
+ 
+def _generate_reset_token() -> str:
+    return str(uuid.uuid4())
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PYDANTIC MODELS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -721,6 +775,18 @@ class IndieRenewOrderRequest(BaseModel):
     email:    str
     password: str
     months:   int
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+ 
+class VerifyOtpRequest(BaseModel):
+    email: str
+    otp:   str
+ 
+class ResetPasswordRequest(BaseModel):
+    email:        str
+    reset_token:  str
+    new_password: str
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -2161,6 +2227,127 @@ def indie_payment_status(order_id: str):
         "months":     doc.get("months"),
         "amount_inr": doc.get("amount_inr"),
     }
+
+@app.post("/auth/forgot-password")
+def forgot_password(req: ForgotPasswordRequest):
+    email = req.email.strip().lower()
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
+        raise HTTPException(400, "Invalid email address")
+ 
+    user = col_users.find_one({"email": email})
+    # Deliberately vague response either way, so attackers can't use this
+    # endpoint to discover which emails are registered.
+    generic_response = {
+        "status":  "ok",
+        "message": "If an account exists for this email, an OTP has been sent.",
+    }
+ 
+    if not user:
+        print(f"ℹ️  Forgot-password requested for non-existent email: {email}", flush=True)
+        return generic_response
+ 
+    now = datetime.now(timezone.utc)
+    otp = _generate_otp()
+ 
+    # Replace any previous unused OTP for this email with a fresh one.
+    col_password_resets.delete_many({"email": email, "used": False})
+    col_password_resets.insert_one({
+        "email":       email,
+        "otp":         otp,
+        "attempts":    0,
+        "used":        False,
+        "reset_token": None,
+        "created_at":  now,
+        "expires_at":  now + timedelta(minutes=OTP_EXPIRY_MINUTES),
+    })
+ 
+    sent = _send_otp_email(email, user.get("name", ""), otp)
+    if not sent:
+        # Don't leak delivery failures to the client — log server-side only.
+        print(f"⚠️  OTP generated but email send failed for {email}", flush=True)
+ 
+    print(f"✅  OTP issued → {email}", flush=True)
+    return generic_response
+ 
+ 
+@app.post("/auth/verify-otp")
+def verify_otp(req: VerifyOtpRequest):
+    email = req.email.strip().lower()
+    otp   = req.otp.strip()
+ 
+    record = col_password_resets.find_one({"email": email, "used": False})
+    if not record:
+        raise HTTPException(400, "No pending reset request for this email. Please request a new OTP.")
+ 
+    now = datetime.now(timezone.utc)
+    if _ensure_utc(record["expires_at"]) <= now:
+        col_password_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(400, "OTP has expired. Please request a new one.")
+ 
+    if record.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        col_password_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(429, "Too many incorrect attempts. Please request a new OTP.")
+ 
+    if record["otp"] != otp:
+        col_password_resets.update_one(
+            {"_id": record["_id"]},
+            {"$inc": {"attempts": 1}},
+        )
+        remaining = OTP_MAX_ATTEMPTS - (record.get("attempts", 0) + 1)
+        raise HTTPException(400, f"Incorrect OTP. {max(0, remaining)} attempt(s) remaining.")
+ 
+    # OTP correct — issue a short-lived reset token so the client doesn't
+    # need to keep resubmitting the OTP on the next screen.
+    reset_token = _generate_reset_token()
+    col_password_resets.update_one(
+        {"_id": record["_id"]},
+        {"$set": {
+            "reset_token":        reset_token,
+            "reset_token_expires": now + timedelta(minutes=RESET_TOKEN_EXPIRY_MINUTES),
+        }},
+    )
+ 
+    print(f"✅  OTP verified → {email}", flush=True)
+    return {"status": "ok", "reset_token": reset_token}
+ 
+ 
+@app.post("/auth/reset-password")
+def reset_password(req: ResetPasswordRequest):
+    email = req.email.strip().lower()
+ 
+    if len(req.new_password.strip()) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+ 
+    record = col_password_resets.find_one({
+        "email":       email,
+        "used":        False,
+        "reset_token": req.reset_token,
+    })
+    if not record:
+        raise HTTPException(400, "Invalid or expired reset session. Please start over.")
+ 
+    now = datetime.now(timezone.utc)
+    token_expiry = record.get("reset_token_expires")
+    if not token_expiry or _ensure_utc(token_expiry) <= now:
+        col_password_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(400, "Reset session expired. Please start over.")
+ 
+    user = col_users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+ 
+    hashed = bcrypt.hashpw(req.new_password.strip().encode(), bcrypt.gensalt()).decode()
+    col_users.update_one({"email": email}, {"$set": {"password": hashed}})
+ 
+    # Mark this reset record used (don't delete immediately — keeps an audit trail)
+    col_password_resets.update_one(
+        {"_id": record["_id"]},
+        {"$set": {"used": True, "used_at": now}},
+    )
+ 
+    print(f"✅  Password reset completed → {email}", flush=True)
+    return {"status": "ok", "message": "Password reset successful. Please sign in."}
+ 
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
