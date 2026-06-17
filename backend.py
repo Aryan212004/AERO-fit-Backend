@@ -193,11 +193,11 @@ print(f"✅  Concurrency controls ready → {MAX_CONCURRENT_SCANS} slots / {MAX_
 
 def _keep_alive():
     """Pings the server every 5 min to prevent Render free-tier sleep."""
-    time.sleep(60)
+    time.sleep(120)
     while True:
         try:
             import requests as _req
-            _req.get("https://aero-fit-backend.onrender.com/health", timeout=10)
+            _req.get("https://aero-fit-backend.onrender.com/health", timeout=5)
             print("✅  Keep-alive ping sent", flush=True)
         except Exception as e:
             print(f"⚠️  Keep-alive failed: {e}", flush=True)

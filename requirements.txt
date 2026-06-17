@@ -8,8 +8,11 @@ pymongo[srv]==4.7.3
 bcrypt==4.2.1
 cloudinary==1.41.0
 google-genai==1.16.0
+google-auth==2.25.2
+google-cloud-firebaseadmin==6.2.0
 razorpay==1.4.2
 requests==2.31.0
 python-multipart==0.0.18
 httpx>=0.28.1
 typing-extensions>=4.8.0
+resend==0.5.0
