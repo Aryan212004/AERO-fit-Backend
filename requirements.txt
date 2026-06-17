@@ -9,7 +9,6 @@ bcrypt==4.2.1
 cloudinary==1.41.0
 google-genai==1.16.0
 google-auth==2.25.2
-google-cloud-firebaseadmin==6.2.0
 razorpay==1.4.2
 requests==2.31.0
 python-multipart==0.0.18
