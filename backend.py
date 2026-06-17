@@ -1386,9 +1386,15 @@ def list_all_members():
         height_m   = height_cm / 100 if height_cm else 0
         bmi        = round(weight / (height_m ** 2), 1) if height_m > 0 else None
 
-        is_indie   = d.get("indie_plan", False)
         gym_id     = d.get("gym_id")
         gym_name   = gym_names.get(gym_id, "") if gym_id else ""
+
+        # ── member_type is derived from gym_id, NOT the indie_plan flag ──────
+        # gym_id presence is the ground truth: a user with no gym is indie,
+        # regardless of whether indie_plan was ever correctly set on legacy
+        # records (e.g. older /admin/add-user signups before the Razorpay
+        # indie flow existed).
+        is_indie   = not gym_id
 
         # Determine expiry
         if is_indie and d.get("indie_expires_at"):
