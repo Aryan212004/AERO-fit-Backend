@@ -735,10 +735,10 @@ class GenerateUserIdsRequest(BaseModel):
     plan_months: int = 1
 
 class InvoiceCreate(BaseModel):
-    gym_id:       str
-    period:       str
-    member_count: int
-    notes:        Optional[str] = ""
+    gym_id:    str
+    period:    str
+    notes:     Optional[str] = ""
+    gross_override: Optional[float] = None 
 
 class InvoiceStatusUpdate(BaseModel):
     status:      str
@@ -1073,57 +1073,51 @@ def delete_gym_admin(admin_id: str):
 #  ROUTES — INVOICES (super admin — manual gym billing)
 # ══════════════════════════════════════════════════════════════════════════════
 
+AEROFIT_FEE_PER_USER = 40
+
 @app.post("/alpha/invoices")
 def create_invoice(req: InvoiceCreate):
     gym = col_gyms.find_one({"gym_id": req.gym_id})
     if not gym:
         raise HTTPException(404, "Gym not found")
 
-    price_per_user = gym.get("price_per_user", 0.0)
-    if price_per_user <= 0:
-        raise HTTPException(400, "This gym has no price_per_user set. Update the gym first.")
-
-    used_ids     = list(col_user_ids.find({"gym_id": req.gym_id, "status": "used"}))
-    member_count = len(used_ids)
-
+    member_count = col_user_ids.count_documents({"gym_id": req.gym_id, "status": "used"})
     if member_count == 0:
         raise HTTPException(400, "This gym has no active members yet (no used User IDs)")
 
-    splits     = _calc_invoice_splits(price_per_user, member_count)
+    auto_gross = round(AEROFIT_FEE_PER_USER * member_count, 2)
+    gross      = round(req.gross_override, 2) if req.gross_override is not None else auto_gross
+
     invoice_id = str(uuid.uuid4())
     inv_number = _invoice_number()
     now        = datetime.now(timezone.utc)
 
     col_invoices.insert_one({
-        "invoice_id":      invoice_id,
-        "invoice_number":  inv_number,
-        "gym_id":          req.gym_id,
-        "gym_name":        gym["name"],
-        "admin_email":     gym.get("admin_email", ""),
-        "period":          req.period,
-        "member_count":    member_count,
-        "price_per_user":  price_per_user,
-        "gross":           splits["gross"],
-        "platform_amount": splits["platform_amount"],
-        "gym_amount":      splits["gym_amount"],
-        "platform_pct":    PLATFORM_SHARE_PCT,
-        "gym_pct":         GYM_SHARE_PCT,
-        "status":          "pending",
-        "notes":           req.notes or "",
-        "created_at":      now,
-        "due_at":          now + timedelta(days=15),
-        "paid_at":         None,
-        "payment_ref":     None,
-        "alerts":          [],
+        "invoice_id":       invoice_id,
+        "invoice_number":   inv_number,
+        "gym_id":           req.gym_id,
+        "gym_name":         gym["name"],
+        "admin_email":      gym.get("admin_email", ""),
+        "period":           req.period,
+        "member_count":     member_count,
+        "fee_per_user":     AEROFIT_FEE_PER_USER,
+        "gross":            gross,
+        "status":           "pending",
+        "notes":            req.notes or "",
+        "created_at":       now,
+        "due_at":           now + timedelta(days=15),
+        "paid_at":          None,
+        "payment_ref":      None,
+        "alerts":           [],
     })
 
-    print(f"✅  Invoice {inv_number} created for {gym['name']} ({member_count} members) → ₹{splits['gross']}", flush=True)
+    print(f"✅  Invoice {inv_number} created for {gym['name']} ({member_count} members × ₹{AEROFIT_FEE_PER_USER}) → ₹{gross}", flush=True)
     return {
         "status":         "created",
         "invoice_id":     invoice_id,
         "invoice_number": inv_number,
         "member_count":   member_count,
-        **splits,
+        "gross":          gross,
         "due_at":         (now + timedelta(days=15)).isoformat(),
     }
 
