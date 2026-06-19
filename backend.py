@@ -1787,6 +1787,23 @@ def list_notifications(gym_id: str):
     docs = list(col_notifs.find({"gym_id": gym_id}).sort("sent_at", DESCENDING).limit(50))
     return [_doc(d) for d in docs]
 
+@app.get("/gym/{gym_id}/notifications/member")
+def list_member_notifications(gym_id: str):
+    """
+    Member-facing feed — excludes notifications tagged for admin-only
+    segments (e.g. billing alerts), so members never see invoice/payment
+    reminders meant for the gym owner.
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    docs = list(
+        col_notifs.find({
+            "gym_id":   gym_id,
+            "segments": {"$nin": ["admin"]},
+        }).sort("sent_at", DESCENDING).limit(50)
+    )
+    return [_doc(d) for d in docs]
+
 @app.delete("/gym/{gym_id}/notifications/{notification_id}")
 def delete_notification(gym_id: str, notification_id: str):
     if not col_gyms.find_one({"gym_id": gym_id}):
