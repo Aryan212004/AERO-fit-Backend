@@ -101,6 +101,7 @@ col_user_ids:    Collection = mdb["gym_user_ids"]
 col_invoices:    Collection = mdb["invoices"]
 col_payments:    Collection = mdb["indie_payments"]
 col_password_resets: Collection = mdb["password_resets"]
+col_signup_otps: Collection = mdb["indie_signup_otps"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
@@ -128,6 +129,8 @@ col_payments.create_index("email")
 col_payments.create_index([("email", 1), ("status", 1)])
 col_password_resets.create_index("email")
 col_password_resets.create_index("expires_at")
+col_signup_otps.create_index("email")
+col_signup_otps.create_index("expires_at")
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -787,6 +790,13 @@ class ResetPasswordRequest(BaseModel):
     email:        str
     reset_token:  str
     new_password: str
+
+class IndieSendOtpRequest(BaseModel):
+    email: str
+
+class IndieVerifySignupOtpRequest(BaseModel):
+    email: str
+    otp:   str
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -1971,6 +1981,64 @@ def indie_pricing(months: int):
         raise HTTPException(400, "months must be 1–12")
     return _indie_pricing(months)
 
+@app.post("/indie/send-signup-otp")
+def indie_send_signup_otp(req: IndieSendOtpRequest):
+    email = req.email.strip().lower()
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
+        raise HTTPException(400, "Invalid email address")
+    if col_users.find_one({"email": email}):
+        raise HTTPException(409, "An account with this email already exists")
+
+    now = datetime.now(timezone.utc)
+    otp = _generate_otp()
+
+    col_signup_otps.delete_many({"email": email, "used": False})
+    col_signup_otps.insert_one({
+        "email":      email,
+        "otp":        otp,
+        "attempts":   0,
+        "used":       False,
+        "verified":   False,
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=OTP_EXPIRY_MINUTES),
+    })
+
+    sent = _send_otp_email(email, "", otp)
+    if not sent:
+        print(f"⚠️  Signup OTP generated but email send failed for {email}", flush=True)
+
+    print(f"✅  Signup OTP issued → {email}", flush=True)
+    return {"status": "ok", "message": "OTP sent to your email."}
+
+
+@app.post("/indie/verify-signup-otp")
+def indie_verify_signup_otp(req: IndieVerifySignupOtpRequest):
+    email = req.email.strip().lower()
+    otp   = req.otp.strip()
+
+    record = col_signup_otps.find_one({"email": email, "used": False})
+    if not record:
+        raise HTTPException(400, "No pending verification for this email. Please request a new OTP.")
+
+    now = datetime.now(timezone.utc)
+    if _ensure_utc(record["expires_at"]) <= now:
+        col_signup_otps.delete_one({"_id": record["_id"]})
+        raise HTTPException(400, "OTP has expired. Please request a new one.")
+
+    if record.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        col_signup_otps.delete_one({"_id": record["_id"]})
+        raise HTTPException(429, "Too many incorrect attempts. Please request a new OTP.")
+
+    if record["otp"] != otp:
+        col_signup_otps.update_one({"_id": record["_id"]}, {"$inc": {"attempts": 1}})
+        remaining = OTP_MAX_ATTEMPTS - (record.get("attempts", 0) + 1)
+        raise HTTPException(400, f"Incorrect OTP. {max(0, remaining)} attempt(s) remaining.")
+
+    # Mark verified — create-order will check this flag before allowing payment
+    col_signup_otps.update_one({"_id": record["_id"]}, {"$set": {"verified": True, "used": True}})
+    print(f"✅  Signup OTP verified → {email}", flush=True)
+    return {"status": "ok"}
+
 
 @app.post("/indie/create-order")
 def indie_create_order(req: IndieOrderRequest):
@@ -1979,6 +2047,16 @@ def indie_create_order(req: IndieOrderRequest):
         raise HTTPException(400, "Invalid email address")
     if col_users.find_one({"email": email}):
         raise HTTPException(409, "An account with this email already exists")
+
+    # ── NEW: require a verified OTP before allowing payment ────────────────
+    otp_record = col_signup_otps.find_one({
+        "email":    email,
+        "verified": True,
+        "used":     True,
+    })
+    if not otp_record:
+        raise HTTPException(400, "Please verify your email with the OTP before proceeding to payment.")
+    # ─────────────────────────────────────────────────────────────────────
 
     existing_pending = col_payments.find_one({"email": email, "status": "pending"})
     if existing_pending:
