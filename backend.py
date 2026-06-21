@@ -72,9 +72,9 @@ print(f"✅  Razorpay configured → key {RAZORPAY_KEY_ID[:12]}…", flush=True)
 
 RESEND_API_KEY  = _require("RESEND_API_KEY")
 RESEND_FROM     = os.environ.get("RESEND_FROM", "AERO-FIT <onboarding@resend.dev>").strip()
- 
+
 resend.api_key = RESEND_API_KEY
- 
+
 OTP_EXPIRY_MINUTES        = int(os.environ.get("OTP_EXPIRY_MINUTES", "10"))
 OTP_MAX_ATTEMPTS          = int(os.environ.get("OTP_MAX_ATTEMPTS", "5"))
 RESET_TOKEN_EXPIRY_MINUTES = int(os.environ.get("RESET_TOKEN_EXPIRY_MINUTES", "15"))
@@ -209,9 +209,11 @@ def _keep_alive():
 
 def _run_expiry_job():
     """
-    Hourly job — two tasks:
+    Hourly job — three tasks:
       1. Expire gym memberships whose user-ID expires_at has passed.
-      2. Expire indie users whose indie_expires_at has passed.
+      2a. Move indie users whose indie_expires_at has passed into a
+          2-day grace period.
+      2b. Permanently delete indie users whose grace period has lapsed.
     """
     time.sleep(30)
     while True:
@@ -250,25 +252,41 @@ def _run_expiry_job():
                 )
                 print(f"   ↳ Deleted User ID: {code} — gym: {gym_id}", flush=True)
 
-            # ── 2. Indie plan expirations ─────────────────────────────────────
-            expired_indie = list(col_users.find({
+            # ── 2a. Indie plan expirations → enter 2-day grace period ──────────
+            newly_expired_indie = list(col_users.find({
                 "indie_plan":         True,
                 "membership_expired": {"$ne": True},
                 "indie_expires_at":   {"$lte": now},
             }))
 
-            if expired_indie:
-                print(f"⏰  Expiry job: processing {len(expired_indie)} expired indie user(s)", flush=True)
+            if newly_expired_indie:
+                print(f"⏰  Expiry job: {len(newly_expired_indie)} indie user(s) entering grace period", flush=True)
 
-            for u in expired_indie:
+            for u in newly_expired_indie:
+                grace_ends = now + timedelta(days=2)
                 col_users.update_one(
                     {"email": u["email"]},
                     {"$set": {
                         "membership_expired":    True,
                         "membership_expired_at": now,
+                        "grace_period_ends_at":  grace_ends,
                     }}
                 )
-                print(f"   ↳ Expired indie user: {u['email']}", flush=True)
+                print(f"   ↳ Indie user entered grace period: {u['email']} (deletes after {grace_ends.isoformat()})", flush=True)
+
+            # ── 2b. Indie users past grace period → permanent deletion ─────────
+            # Gym members are NEVER auto-deleted — only indie accounts.
+            to_delete = list(col_users.find({
+                "indie_plan":           True,
+                "membership_expired":   True,
+                "grace_period_ends_at": {"$lte": now},
+            }))
+
+            if to_delete:
+                print(f"🗑️  Expiry job: {len(to_delete)} indie user(s) past grace period — deleting", flush=True)
+
+            for u in to_delete:
+                _cascade_delete_indie_user(u["email"])
 
         except Exception as e:
             print(f"⚠️  Expiry job error: {e}", flush=True)
@@ -536,6 +554,35 @@ def _cascade_delete_gym(gym_id: str) -> dict:
     return summary
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CASCADE INDIE-USER DELETE HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _cascade_delete_indie_user(email: str) -> dict:
+    """
+    Permanently deletes an independent (non-gym) user who failed to renew
+    within the 2-day grace period after their plan expired.
+    Deletes: user record, meal logs, scan-limit records.
+    Payment history is intentionally kept for accounting purposes.
+    Gym members are NEVER passed to this function.
+    """
+    meals_result = col_meals.delete_many({"email": email})
+    scans_result = col_scan_limits.delete_many({"email": email})
+    user_result  = col_users.delete_one({"email": email})
+
+    summary = {
+        "email":         email,
+        "user_deleted":  user_result.deleted_count,
+        "meals_deleted": meals_result.deleted_count,
+        "scans_deleted": scans_result.deleted_count,
+    }
+    print(
+        f"🗑️  Cascade indie delete → {email} | "
+        f"meals={summary['meals_deleted']} scans={summary['scans_deleted']}",
+        flush=True,
+    )
+    return summary
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FCM PUSH SENDER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -606,8 +653,8 @@ def _send_fcm_push(gym_id: str, title: str, body: str, data: dict = {}):
 
 def _generate_otp() -> str:
     return f"{random.randint(0, 999999):06d}"
- 
- 
+
+
 def _send_otp_email(to_email: str, name: str, otp: str) -> bool:
     """
     Sends the OTP email via Resend. Returns True on success.
@@ -639,8 +686,8 @@ def _send_otp_email(to_email: str, name: str, otp: str) -> bool:
     except Exception as e:
         print(f"⚠️  Failed to send OTP email to {to_email}: {e}", flush=True)
         return False
- 
- 
+
+
 def _generate_reset_token() -> str:
     return str(uuid.uuid4())
 
@@ -781,11 +828,11 @@ class IndieRenewOrderRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
- 
+
 class VerifyOtpRequest(BaseModel):
     email: str
     otp:   str
- 
+
 class ResetPasswordRequest(BaseModel):
     email:        str
     reset_token:  str
@@ -1506,12 +1553,21 @@ def user_login(req: UserLogin):
     if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
         raise HTTPException(401, "Invalid email or password")
 
-    if user.get("membership_expired"):
-        raise HTTPException(403, "membership_expired")
+    now      = datetime.now(timezone.utc)
+    is_indie = bool(user.get("indie_plan")) and not user.get("gym_id")
+    expired_flag = bool(user.get("membership_expired", False))
 
-    now = datetime.now(timezone.utc)
+    if expired_flag:
+        if is_indie:
+            grace_ends = _ensure_utc(user.get("grace_period_ends_at"))
+            if not (grace_ends and grace_ends > now):
+                raise HTTPException(403, "membership_expired")
+            # else: still inside the 2-day grace period — let them log in
+            # so they can reach the Billing card and renew.
+        else:
+            raise HTTPException(403, "membership_expired")
 
-    if user.get("indie_plan") and user.get("indie_expires_at"):
+    if is_indie and user.get("indie_expires_at") and not expired_flag:
         indie_exp = _ensure_utc(user["indie_expires_at"])
         if indie_exp and indie_exp <= now:
             col_users.update_one(
@@ -1519,9 +1575,11 @@ def user_login(req: UserLogin):
                 {"$set": {
                     "membership_expired":    True,
                     "membership_expired_at": now,
+                    "grace_period_ends_at":  now + timedelta(days=2),
                 }}
             )
-            raise HTTPException(403, "membership_expired")
+            expired_flag = True
+            # don't raise — grace period just started, allow this login through
 
     gym_name = ""
     if user.get("gym_id"):
@@ -1561,7 +1619,7 @@ def user_login(req: UserLogin):
             "indie_plan":         user.get("indie_plan", False),
             "plan_months":        user.get("plan_months", 1),
             "plan_label":         user.get("plan_label", "1 Month"),
-            "membership_expired": False,
+            "membership_expired": expired_flag,
             "membership_expires": membership_expires,
         },
     }
@@ -1640,29 +1698,52 @@ def membership_status(email: str):
     if not user:
         raise HTTPException(404, "User not found")
 
+    now      = datetime.now(timezone.utc)
+    is_indie = bool(user.get("indie_plan")) and not user.get("gym_id")
+
     if user.get("membership_expired"):
+        if is_indie:
+            grace_ends = _ensure_utc(user.get("grace_period_ends_at"))
+            if grace_ends and grace_ends > now:
+                # Still inside the 2-day grace window — keep the app usable
+                # so the user can reach the Billing card and renew.
+                return {
+                    "valid":                 True,
+                    "reason":                "grace_period",
+                    "expired_at":            _fmt_dt(user.get("membership_expired_at")),
+                    "grace_period_ends_at":  _fmt_dt(grace_ends),
+                }
+            # Grace period over — should already be deleted by the
+            # background job; this is just a fail-safe.
+            return {
+                "valid":      False,
+                "reason":     "expired",
+                "expired_at": _fmt_dt(user.get("membership_expired_at")),
+            }
+        # Gym members — unchanged original behaviour.
         return {
             "valid":      False,
             "reason":     "expired",
             "expired_at": _fmt_dt(user.get("membership_expired_at")),
         }
 
-    now = datetime.now(timezone.utc)
-
-    if user.get("indie_plan") and user.get("indie_expires_at"):
+    if is_indie and user.get("indie_expires_at"):
         indie_exp = _ensure_utc(user["indie_expires_at"])
         if indie_exp and indie_exp <= now:
+            grace_ends = now + timedelta(days=2)
             col_users.update_one(
                 {"email": email},
                 {"$set": {
                     "membership_expired":    True,
                     "membership_expired_at": now,
+                    "grace_period_ends_at":  grace_ends,
                 }}
             )
             return {
-                "valid":      False,
-                "reason":     "expired",
-                "expired_at": _fmt_dt(indie_exp),
+                "valid":                True,
+                "reason":               "grace_period",
+                "expired_at":           _fmt_dt(now),
+                "grace_period_ends_at": _fmt_dt(grace_ends),
             }
         return {
             "valid":      True,
@@ -1674,7 +1755,6 @@ def membership_status(email: str):
         return {"valid": True, "reason": "no_gym"}
 
     uid_doc = col_user_ids.find_one({"used_by": email, "gym_id": user["gym_id"]})
-
     if uid_doc:
         expires_at = uid_doc.get("expires_at")
         if expires_at and _ensure_utc(expires_at) <= now:
@@ -1686,18 +1766,38 @@ def membership_status(email: str):
                     "gym_id":                None,
                 }}
             )
-            return {
-                "valid":      False,
-                "reason":     "expired",
-                "expired_at": _fmt_dt(expires_at),
-            }
-        return {
-            "valid":      True,
-            "reason":     "active",
-            "expires_at": _fmt_dt(expires_at),
-        }
+            return {"valid": False, "reason": "expired", "expired_at": _fmt_dt(expires_at)}
+        return {"valid": True, "reason": "active", "expires_at": _fmt_dt(expires_at)}
 
     return {"valid": True, "reason": "active"}
+
+@app.get("/indie/billing-status/{email}")
+def indie_billing_status(email: str):
+    """
+    Lightweight billing summary for the Profile → Billing card.
+    Returns is_indie:false for gym members (frontend hides the card).
+    """
+    email = email.strip().lower()
+    user  = col_users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    is_indie = bool(user.get("indie_plan")) and not user.get("gym_id")
+    if not is_indie:
+        return {"is_indie": False}
+
+    expires_at = _ensure_utc(user.get("indie_expires_at"))
+    grace_ends = _ensure_utc(user.get("grace_period_ends_at"))
+
+    return {
+        "is_indie":              True,
+        "email":                 email,
+        "plan_label":            user.get("plan_label", "1 Month"),
+        "plan_months":           user.get("plan_months", 1),
+        "indie_expires_at":      _fmt_dt(expires_at) if expires_at else None,
+        "membership_expired":    user.get("membership_expired", False),
+        "grace_period_ends_at":  _fmt_dt(grace_ends) if grace_ends else None,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — BANNERS
@@ -2276,12 +2376,18 @@ def indie_verify_renewal(req: IndieVerifyRequest):
 
     col_users.update_one(
         {"email": email},
-        {"$set": {
-            "indie_expires_at":   new_exp,
-            "membership_expired": False,
-            "plan_months":        months,
-            "plan_label":         f"{months} Month{'s' if months > 1 else ''}",
-        }}
+        {
+            "$set": {
+                "indie_expires_at":   new_exp,
+                "membership_expired": False,
+                "plan_months":        months,
+                "plan_label":         f"{months} Month{'s' if months > 1 else ''}",
+            },
+            "$unset": {
+                "membership_expired_at": "",
+                "grace_period_ends_at":  "",
+            },
+        }
     )
 
     col_payments.update_one(
@@ -2322,7 +2428,7 @@ def forgot_password(req: ForgotPasswordRequest):
     email = req.email.strip().lower()
     if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
         raise HTTPException(400, "Invalid email address")
- 
+
     user = col_users.find_one({"email": email})
     # Deliberately vague response either way, so attackers can't use this
     # endpoint to discover which emails are registered.
@@ -2330,14 +2436,14 @@ def forgot_password(req: ForgotPasswordRequest):
         "status":  "ok",
         "message": "If an account exists for this email, an OTP has been sent.",
     }
- 
+
     if not user:
         print(f"ℹ️  Forgot-password requested for non-existent email: {email}", flush=True)
         return generic_response
- 
+
     now = datetime.now(timezone.utc)
     otp = _generate_otp()
- 
+
     # Replace any previous unused OTP for this email with a fresh one.
     col_password_resets.delete_many({"email": email, "used": False})
     col_password_resets.insert_one({
@@ -2349,34 +2455,34 @@ def forgot_password(req: ForgotPasswordRequest):
         "created_at":  now,
         "expires_at":  now + timedelta(minutes=OTP_EXPIRY_MINUTES),
     })
- 
+
     sent = _send_otp_email(email, user.get("name", ""), otp)
     if not sent:
         # Don't leak delivery failures to the client — log server-side only.
         print(f"⚠️  OTP generated but email send failed for {email}", flush=True)
- 
+
     print(f"✅  OTP issued → {email}", flush=True)
     return generic_response
- 
- 
+
+
 @app.post("/auth/verify-otp")
 def verify_otp(req: VerifyOtpRequest):
     email = req.email.strip().lower()
     otp   = req.otp.strip()
- 
+
     record = col_password_resets.find_one({"email": email, "used": False})
     if not record:
         raise HTTPException(400, "No pending reset request for this email. Please request a new OTP.")
- 
+
     now = datetime.now(timezone.utc)
     if _ensure_utc(record["expires_at"]) <= now:
         col_password_resets.delete_one({"_id": record["_id"]})
         raise HTTPException(400, "OTP has expired. Please request a new one.")
- 
+
     if record.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
         col_password_resets.delete_one({"_id": record["_id"]})
         raise HTTPException(429, "Too many incorrect attempts. Please request a new OTP.")
- 
+
     if record["otp"] != otp:
         col_password_resets.update_one(
             {"_id": record["_id"]},
@@ -2384,7 +2490,7 @@ def verify_otp(req: VerifyOtpRequest):
         )
         remaining = OTP_MAX_ATTEMPTS - (record.get("attempts", 0) + 1)
         raise HTTPException(400, f"Incorrect OTP. {max(0, remaining)} attempt(s) remaining.")
- 
+
     # OTP correct — issue a short-lived reset token so the client doesn't
     # need to keep resubmitting the OTP on the next screen.
     reset_token = _generate_reset_token()
@@ -2395,18 +2501,18 @@ def verify_otp(req: VerifyOtpRequest):
             "reset_token_expires": now + timedelta(minutes=RESET_TOKEN_EXPIRY_MINUTES),
         }},
     )
- 
+
     print(f"✅  OTP verified → {email}", flush=True)
     return {"status": "ok", "reset_token": reset_token}
- 
- 
+
+
 @app.post("/auth/reset-password")
 def reset_password(req: ResetPasswordRequest):
     email = req.email.strip().lower()
- 
+
     if len(req.new_password.strip()) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
- 
+
     record = col_password_resets.find_one({
         "email":       email,
         "used":        False,
@@ -2414,29 +2520,29 @@ def reset_password(req: ResetPasswordRequest):
     })
     if not record:
         raise HTTPException(400, "Invalid or expired reset session. Please start over.")
- 
+
     now = datetime.now(timezone.utc)
     token_expiry = record.get("reset_token_expires")
     if not token_expiry or _ensure_utc(token_expiry) <= now:
         col_password_resets.delete_one({"_id": record["_id"]})
         raise HTTPException(400, "Reset session expired. Please start over.")
- 
+
     user = col_users.find_one({"email": email})
     if not user:
         raise HTTPException(404, "User not found")
- 
+
     hashed = bcrypt.hashpw(req.new_password.strip().encode(), bcrypt.gensalt()).decode()
     col_users.update_one({"email": email}, {"$set": {"password": hashed}})
- 
+
     # Mark this reset record used (don't delete immediately — keeps an audit trail)
     col_password_resets.update_one(
         {"_id": record["_id"]},
         {"$set": {"used": True, "used_at": now}},
     )
- 
+
     print(f"✅  Password reset completed → {email}", flush=True)
     return {"status": "ok", "message": "Password reset successful. Please sign in."}
- 
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
