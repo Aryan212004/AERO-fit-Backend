@@ -823,7 +823,6 @@ class IndieVerifyRequest(BaseModel):
 
 class IndieRenewOrderRequest(BaseModel):
     email:    str
-    password: str
     months:   int
 
 class ForgotPasswordRequest(BaseModel):
@@ -2297,8 +2296,6 @@ def indie_create_renewal_order(req: IndieRenewOrderRequest):
         raise HTTPException(404, "User not found")
     if not user.get("indie_plan"):
         raise HTTPException(400, "Only independent plan users can renew here")
-    if not bcrypt.checkpw(req.password.encode(), user["password"].encode()):
-        raise HTTPException(401, "Invalid password")
 
     months  = max(1, min(req.months, 12))
     pricing = _indie_pricing(months)
