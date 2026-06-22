@@ -102,6 +102,7 @@ col_invoices:    Collection = mdb["invoices"]
 col_payments:    Collection = mdb["indie_payments"]
 col_password_resets: Collection = mdb["password_resets"]
 col_signup_otps: Collection = mdb["indie_signup_otps"]
+col_indie_notifs: Collection = mdb["indie_notifications"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
@@ -131,6 +132,9 @@ col_password_resets.create_index("email")
 col_password_resets.create_index("expires_at")
 col_signup_otps.create_index("email")
 col_signup_otps.create_index("expires_at")
+col_indie_notifs.create_index([("email", 1), ("sent_at", -1)])
+col_indie_notifs.create_index([("email", 1), ("alert_key", 1)], unique=True)
+col_indie_notifs.create_index("read")
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -189,148 +193,6 @@ async def _cleanup_stale_locks():
             print(f"🧹  Cleaned up {len(stale)} stale user lock(s)", flush=True)
 
 print(f"✅  Concurrency controls ready → {MAX_CONCURRENT_SCANS} slots / {MAX_QUEUE_DEPTH} max queue depth", flush=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BACKGROUND THREADS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _keep_alive():
-    """Pings the server every 5 min to prevent Render free-tier sleep."""
-    time.sleep(120)
-    while True:
-        try:
-            import requests as _req
-            _req.get("https://aero-fit-backend.onrender.com/health", timeout=5)
-            print("✅  Keep-alive ping sent", flush=True)
-        except Exception as e:
-            print(f"⚠️  Keep-alive failed: {e}", flush=True)
-        time.sleep(300)
-
-
-def _run_expiry_job():
-    """
-    Hourly job — three tasks:
-      1. Expire gym memberships whose user-ID expires_at has passed.
-      2a. Move indie users whose indie_expires_at has passed into a
-          2-day grace period.
-      2b. Permanently delete indie users whose grace period has lapsed.
-    """
-    time.sleep(30)
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-
-            # ── 1. Gym memberships ────────────────────────────────────────────
-            expired_ids = list(col_user_ids.find({
-                "status":     "used",
-                "expires_at": {"$lte": now},
-            }))
-
-            if expired_ids:
-                print(f"⏰  Expiry job: processing {len(expired_ids)} expired gym User ID(s)", flush=True)
-
-            for uid_doc in expired_ids:
-                code    = uid_doc.get("code")
-                gym_id  = uid_doc.get("gym_id")
-                used_by = uid_doc.get("used_by")
-
-                if used_by:
-                    col_users.update_one(
-                        {"email": used_by},
-                        {"$set": {
-                            "membership_expired":    True,
-                            "membership_expired_at": now,
-                            "gym_id":                None,
-                        }}
-                    )
-                    print(f"   ↳ Expired gym user: {used_by}", flush=True)
-
-                col_user_ids.delete_one({"gym_id": gym_id, "code": code})
-                col_gyms.update_one(
-                    {"gym_id": gym_id, "members": {"$gt": 0}},
-                    {"$inc": {"members": -1}}
-                )
-                print(f"   ↳ Deleted User ID: {code} — gym: {gym_id}", flush=True)
-
-            # ── 2a. Indie plan expirations → enter 2-day grace period ──────────
-            newly_expired_indie = list(col_users.find({
-                "indie_plan":         True,
-                "membership_expired": {"$ne": True},
-                "indie_expires_at":   {"$lte": now},
-            }))
-
-            if newly_expired_indie:
-                print(f"⏰  Expiry job: {len(newly_expired_indie)} indie user(s) entering grace period", flush=True)
-
-            for u in newly_expired_indie:
-                grace_ends = now + timedelta(days=2)
-                col_users.update_one(
-                    {"email": u["email"]},
-                    {"$set": {
-                        "membership_expired":    True,
-                        "membership_expired_at": now,
-                        "grace_period_ends_at":  grace_ends,
-                    }}
-                )
-                print(f"   ↳ Indie user entered grace period: {u['email']} (deletes after {grace_ends.isoformat()})", flush=True)
-
-            # ── 2b. Indie users past grace period → permanent deletion ─────────
-            # Gym members are NEVER auto-deleted — only indie accounts.
-            to_delete = list(col_users.find({
-                "indie_plan":           True,
-                "membership_expired":   True,
-                "grace_period_ends_at": {"$lte": now},
-            }))
-
-            if to_delete:
-                print(f"🗑️  Expiry job: {len(to_delete)} indie user(s) past grace period — deleting", flush=True)
-
-            for u in to_delete:
-                _cascade_delete_indie_user(u["email"])
-
-        except Exception as e:
-            print(f"⚠️  Expiry job error: {e}", flush=True)
-
-        time.sleep(3600)
-
-
-threading.Thread(target=_keep_alive,     daemon=True).start()
-threading.Thread(target=_run_expiry_job, daemon=True).start()
-print("✅  Background threads started (keep-alive + expiry job)", flush=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FASTAPI APP
-# ══════════════════════════════════════════════════════════════════════════════
-
-app = FastAPI(title="AERO-FIT API", version="17.0.0")
-
-ALLOWED_ORIGINS = [
-    "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
-    "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:3000",
-    # "https://your-admin-dashboard.vercel.app",  ← uncomment and add your URL
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins     = ALLOWED_ORIGINS,
-    allow_credentials = False,
-    allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers     = ["*"],
-    expose_headers    = ["*", "Retry-After"],
-    max_age           = 3600,
-)
-
-@app.options("/{rest_of_path:path}")
-async def preflight_handler(request: Request, rest_of_path: str):
-    return JSONResponse(
-        content={},
-        headers={
-            "Access-Control-Allow-Origin":  request.headers.get("origin", "*"),
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Max-Age":       "3600",
-        },
-    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -561,29 +423,33 @@ def _cascade_delete_indie_user(email: str) -> dict:
     """
     Permanently deletes an independent (non-gym) user who failed to renew
     within the 2-day grace period after their plan expired.
-    Deletes: user record, meal logs, scan-limit records.
+    Deletes: user record, meal logs, scan-limit records, and any indie
+    billing-alert notifications for this email.
     Payment history is intentionally kept for accounting purposes.
     Gym members are NEVER passed to this function.
     """
-    meals_result = col_meals.delete_many({"email": email})
-    scans_result = col_scan_limits.delete_many({"email": email})
-    user_result  = col_users.delete_one({"email": email})
+    meals_result  = col_meals.delete_many({"email": email})
+    scans_result  = col_scan_limits.delete_many({"email": email})
+    notifs_result = col_indie_notifs.delete_many({"email": email})
+    user_result   = col_users.delete_one({"email": email})
 
     summary = {
         "email":         email,
         "user_deleted":  user_result.deleted_count,
         "meals_deleted": meals_result.deleted_count,
         "scans_deleted": scans_result.deleted_count,
+        "notifs_deleted": notifs_result.deleted_count,
     }
     print(
         f"🗑️  Cascade indie delete → {email} | "
-        f"meals={summary['meals_deleted']} scans={summary['scans_deleted']}",
+        f"meals={summary['meals_deleted']} scans={summary['scans_deleted']} "
+        f"notifs={summary['notifs_deleted']}",
         flush=True,
     )
     return summary
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FCM PUSH SENDER
+#  FCM PUSH SENDER (gym — topic-based)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _send_fcm_push(gym_id: str, title: str, body: str, data: dict = {}):
@@ -651,6 +517,129 @@ def _send_fcm_push(gym_id: str, title: str, body: str, data: dict = {}):
     except Exception as e:
         print(f"⚠️  FCM push failed: {e}", flush=True)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FCM PUSH SENDER (indie — direct device-token based)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _send_fcm_push_to_token(token: str, title: str, body: str, data: dict = {}):
+    """
+    Sends an OS-level push notification to a single device by FCM token.
+    Used for independent (non-gym) users who aren't subscribed to any
+    gym_{id} topic. Mirrors _send_fcm_push but targets `token` not `topic`.
+    """
+    try:
+        if not token:
+            print("⚠️  _send_fcm_push_to_token: empty token — skipping", flush=True)
+            return
+        if not FIREBASE_PROJECT_ID:
+            print("⚠️  FIREBASE_PROJECT_ID not set — skipping push", flush=True)
+            return
+        if not os.path.exists(FIREBASE_CREDS_PATH):
+            print(f"⚠️  Firebase creds not found at {FIREBASE_CREDS_PATH}", flush=True)
+            return
+
+        creds = service_account.Credentials.from_service_account_file(
+            FIREBASE_CREDS_PATH,
+            scopes=["https://www.googleapis.com/auth/firebase.messaging"],
+        )
+        creds.refresh(google.auth.transport.requests.Request())
+
+        resp = http_requests.post(
+            f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send",
+            headers={
+                "Authorization": f"Bearer {creds.token}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "message": {
+                    "token": token,
+                    "notification": {
+                        "title": title,
+                        "body":  body,
+                    },
+                    "data": {k: str(v) for k, v in data.items()},
+                    "android": {
+                        "priority": "high",
+                        "notification": {
+                            "channel_id":           "aerofit_channel",
+                            "default_sound":        True,
+                            "notification_priority": "PRIORITY_HIGH",
+                        },
+                    },
+                    "apns": {
+                        "headers": {"apns-priority": "10"},
+                        "payload": {
+                            "aps": {
+                                "sound":             "default",
+                                "badge":             1,
+                                "content-available": 1,
+                            }
+                        },
+                    },
+                }
+            },
+            timeout=10,
+        )
+
+        result = resp.json()
+        if resp.status_code == 200:
+            print(f"✅  FCM push (token) sent → title='{title}'", flush=True)
+        else:
+            print(f"⚠️  FCM token-push error {resp.status_code}: {result}", flush=True)
+
+    except Exception as e:
+        print(f"⚠️  FCM token-push failed: {e}", flush=True)
+
+
+def _create_indie_alert(
+    email: str,
+    alert_key: str,
+    title: str,
+    body: str,
+    alert_type: str,
+    deep_link: str = "aerofit://profile/billing",
+) -> bool:
+    """
+    Creates an in-app indie notification AND fires a direct device push,
+    but only ONCE per (email, alert_key) — alert_key acts as a dedupe
+    fingerprint (e.g. "expiring_soon_2026-06-25" or "grace_period_2026-06-22")
+    so the hourly job never spams the same alert twice.
+
+    Returns True if a new alert was created, False if it already existed
+    (i.e. already sent — safe to call every hour without duplicating).
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        col_indie_notifs.insert_one({
+            "notification_id": str(uuid.uuid4()),
+            "email":            email,
+            "alert_key":        alert_key,
+            "alert_type":       alert_type,   # "expiring_soon" | "grace_period" | "renewed"
+            "title":            title,
+            "body":             body,
+            "deep_link":        deep_link,
+            "read":             False,
+            "sent_at":          now,
+        })
+    except Exception:
+        # Duplicate key on (email, alert_key) — already sent this exact alert.
+        return False
+
+    user  = col_users.find_one({"email": email}, {"fcm_token": 1})
+    token = (user or {}).get("fcm_token", "")
+    if token:
+        _send_fcm_push_to_token(
+            token, title, body,
+            data={"type": alert_type, "deep_link": deep_link},
+        )
+    else:
+        print(f"ℹ️  No fcm_token on file for {email} — in-app alert created, push skipped", flush=True)
+
+    print(f"✅  Indie alert created → {email} | {alert_key}", flush=True)
+    return True
+
+
 def _generate_otp() -> str:
     return f"{random.randint(0, 999999):06d}"
 
@@ -690,6 +679,188 @@ def _send_otp_email(to_email: str, name: str, otp: str) -> bool:
 
 def _generate_reset_token() -> str:
     return str(uuid.uuid4())
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKGROUND THREADS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _keep_alive():
+    """Pings the server every 5 min to prevent Render free-tier sleep."""
+    time.sleep(120)
+    while True:
+        try:
+            import requests as _req
+            _req.get("https://aero-fit-backend.onrender.com/health", timeout=5)
+            print("✅  Keep-alive ping sent", flush=True)
+        except Exception as e:
+            print(f"⚠️  Keep-alive failed: {e}", flush=True)
+        time.sleep(300)
+
+
+def _run_expiry_job():
+    """
+    Hourly job — now FOUR tasks:
+      1. Expire gym memberships whose user-ID expires_at has passed.
+      2a. Raise a "renew soon" billing alert (in-app + push) for indie
+          users whose plan expires within the next 3 days.
+      2b. Move indie users whose indie_expires_at has passed into a
+          2-day grace period, AND raise a "grace period" billing alert
+          (in-app + push) the moment that happens.
+      2c. Permanently delete indie users whose grace period has lapsed.
+
+    Gym members are NEVER auto-deleted — only indie accounts, and only
+    after they fail to renew within the 2-day grace window.
+    """
+    time.sleep(30)
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            # ── 1. Gym memberships ────────────────────────────────────────────
+            expired_ids = list(col_user_ids.find({
+                "status":     "used",
+                "expires_at": {"$lte": now},
+            }))
+
+            if expired_ids:
+                print(f"⏰  Expiry job: processing {len(expired_ids)} expired gym User ID(s)", flush=True)
+
+            for uid_doc in expired_ids:
+                code    = uid_doc.get("code")
+                gym_id  = uid_doc.get("gym_id")
+                used_by = uid_doc.get("used_by")
+
+                if used_by:
+                    col_users.update_one(
+                        {"email": used_by},
+                        {"$set": {
+                            "membership_expired":    True,
+                            "membership_expired_at": now,
+                            "gym_id":                None,
+                        }}
+                    )
+                    print(f"   ↳ Expired gym user: {used_by}", flush=True)
+
+                col_user_ids.delete_one({"gym_id": gym_id, "code": code})
+                col_gyms.update_one(
+                    {"gym_id": gym_id, "members": {"$gt": 0}},
+                    {"$inc": {"members": -1}}
+                )
+                print(f"   ↳ Deleted User ID: {code} — gym: {gym_id}", flush=True)
+
+            # ── 2a. Indie plans expiring within 3 days → "renew soon" alert ────
+            soon_cutoff = now + timedelta(days=3)
+            expiring_soon = list(col_users.find({
+                "indie_plan":         True,
+                "membership_expired": {"$ne": True},
+                "indie_expires_at":   {"$lte": soon_cutoff, "$gt": now},
+            }))
+
+            for u in expiring_soon:
+                exp = _ensure_utc(u["indie_expires_at"])
+                days_left = max(0, (exp - now).days)
+                alert_key = f"expiring_soon_{exp.strftime('%Y-%m-%d')}"
+                _create_indie_alert(
+                    email=u["email"],
+                    alert_key=alert_key,
+                    alert_type="expiring_soon",
+                    title="⏳ Your AERO-FIT plan ends soon",
+                    body=(
+                        f"Your plan expires in {days_left} day{'s' if days_left != 1 else ''}. "
+                        "Extend it from your Profile to avoid losing access."
+                    ),
+                )
+
+            # ── 2b. Indie plan expirations → enter 2-day grace period ──────────
+            newly_expired_indie = list(col_users.find({
+                "indie_plan":         True,
+                "membership_expired": {"$ne": True},
+                "indie_expires_at":   {"$lte": now},
+            }))
+
+            if newly_expired_indie:
+                print(f"⏰  Expiry job: {len(newly_expired_indie)} indie user(s) entering grace period", flush=True)
+
+            for u in newly_expired_indie:
+                grace_ends = now + timedelta(days=2)
+                col_users.update_one(
+                    {"email": u["email"]},
+                    {"$set": {
+                        "membership_expired":    True,
+                        "membership_expired_at": now,
+                        "grace_period_ends_at":  grace_ends,
+                    }}
+                )
+                print(f"   ↳ Indie user entered grace period: {u['email']} (deletes after {grace_ends.isoformat()})", flush=True)
+
+                _create_indie_alert(
+                    email=u["email"],
+                    alert_key=f"grace_period_{grace_ends.strftime('%Y-%m-%d')}",
+                    alert_type="grace_period",
+                    title="🚨 Your AERO-FIT plan has expired",
+                    body=(
+                        "Renew within 2 days from your Profile or your account "
+                        "and all data will be permanently deleted."
+                    ),
+                )
+
+            # ── 2c. Indie users past grace period → permanent deletion ─────────
+            # Gym members are NEVER auto-deleted — only indie accounts.
+            to_delete = list(col_users.find({
+                "indie_plan":           True,
+                "membership_expired":   True,
+                "grace_period_ends_at": {"$lte": now},
+            }))
+
+            if to_delete:
+                print(f"🗑️  Expiry job: {len(to_delete)} indie user(s) past grace period — deleting", flush=True)
+
+            for u in to_delete:
+                _cascade_delete_indie_user(u["email"])
+
+        except Exception as e:
+            print(f"⚠️  Expiry job error: {e}", flush=True)
+
+        time.sleep(3600)
+
+
+threading.Thread(target=_keep_alive,     daemon=True).start()
+threading.Thread(target=_run_expiry_job, daemon=True).start()
+print("✅  Background threads started (keep-alive + expiry job)", flush=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FASTAPI APP
+# ══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(title="AERO-FIT API", version="18.0.0")
+
+ALLOWED_ORIGINS = [
+    "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
+    "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:3000",
+    # "https://your-admin-dashboard.vercel.app",  ← uncomment and add your URL
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins     = ALLOWED_ORIGINS,
+    allow_credentials = False,
+    allow_methods     = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers     = ["*"],
+    expose_headers    = ["*", "Retry-After"],
+    max_age           = 3600,
+)
+
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(request: Request, rest_of_path: str):
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin":  request.headers.get("origin", "*"),
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age":       "3600",
+        },
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PYDANTIC MODELS
@@ -852,7 +1023,7 @@ class IndieVerifySignupOtpRequest(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "17.0.0",
+        "version":        "18.0.0",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -1799,6 +1970,56 @@ def indie_billing_status(email: str):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — INDIE BILLING NOTIFICATIONS (in-app feed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/indie/notifications/{email}")
+def get_indie_notifications(email: str):
+    """
+    Returns the indie billing-alert feed for one user, newest first.
+    Frontend calls this on Profile screen open (and/or polls it) to render
+    in-app banners and an unread badge. Always scoped by email — indie
+    users have no gym_id to key off of, unlike the gym notification feed.
+    """
+    email = email.strip().lower()
+    docs = list(
+        col_indie_notifs.find({"email": email})
+        .sort("sent_at", DESCENDING)
+        .limit(20)
+    )
+    return [_doc(d) for d in docs]
+
+
+@app.get("/indie/notifications/{email}/unread-count")
+def get_indie_unread_count(email: str):
+    """Lightweight count for a notification-bell badge."""
+    email = email.strip().lower()
+    count = col_indie_notifs.count_documents({"email": email, "read": False})
+    return {"unread": count}
+
+
+@app.post("/indie/notifications/{notification_id}/read")
+def mark_indie_notification_read(notification_id: str):
+    result = col_indie_notifs.update_one(
+        {"notification_id": notification_id},
+        {"$set": {"read": True, "read_at": datetime.now(timezone.utc)}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Notification not found")
+    return {"status": "ok"}
+
+
+@app.post("/indie/notifications/{email}/read-all")
+def mark_all_indie_notifications_read(email: str):
+    """Convenience bulk endpoint — call when the user opens the alert feed."""
+    email = email.strip().lower()
+    result = col_indie_notifs.update_many(
+        {"email": email, "read": False},
+        {"$set": {"read": True, "read_at": datetime.now(timezone.utc)}},
+    )
+    return {"status": "ok", "updated": result.modified_count}
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — BANNERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1852,7 +2073,7 @@ def delete_banner(gym_id: str, banner_id: str):
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — NOTIFICATIONS (with FCM push)
+#  ROUTES — NOTIFICATIONS (with FCM push) — GYM ONLY
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/gym/{gym_id}/notifications")
@@ -2147,7 +2368,7 @@ def indie_create_order(req: IndieOrderRequest):
     if col_users.find_one({"email": email}):
         raise HTTPException(409, "An account with this email already exists")
 
-    # ── NEW: require a verified OTP before allowing payment ────────────────
+    # ── Require a verified OTP before allowing payment ──────────────────────
     otp_record = col_signup_otps.find_one({
         "email":    email,
         "verified": True,
@@ -2397,6 +2618,15 @@ def indie_verify_renewal(req: IndieVerifyRequest):
     )
 
     print(f"✅  Renewal verified → {email}  {months}mo  new expiry: {new_exp.isoformat()}  pid={req.razorpay_payment_id}", flush=True)
+
+    _create_indie_alert(
+        email=email,
+        alert_key=f"renewed_{req.razorpay_payment_id}",
+        alert_type="renewed",
+        title="✅ Plan renewed",
+        body=f"Your AERO-FIT plan is now active until {new_exp.strftime('%d %b %Y')}.",
+    )
+
     return {
         "status":             "renewed",
         "email":              email,
