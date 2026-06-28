@@ -716,6 +716,9 @@ def _run_expiry_job():
         try:
             now = datetime.now(timezone.utc)
 
+            # ── 0. Billing alerts older than 2 days → permanent delete ─────────
+            _cleanup_old_billing_alerts(now)
+
             # ── 1. Gym memberships ────────────────────────────────────────────
             expired_ids = list(col_user_ids.find({
                 "status":     "used",
@@ -1428,6 +1431,23 @@ def _alert_title(alert_type: str, inv_number: str) -> str:
         "receipt":          f"✅ Payment Received — {inv_number}",
     }
     return MAP.get(alert_type, f"📋 Invoice Alert — {inv_number}")
+
+def _cleanup_old_billing_alerts(now: datetime) -> int:
+    """
+    Deletes billing-alert notifications (the ones super admin sends to gym
+    admins via /alpha/invoices/{id}/alert) once they're older than 2 days.
+    These are stored in col_notifs with type == "billing". Gym members
+    never see these (they're filtered out by the /member endpoint), so
+    this only affects what shows in the gym admin's Billing tab.
+    """
+    cutoff = now - timedelta(days=2)
+    result = col_notifs.delete_many({
+        "type":    "billing",
+        "sent_at": {"$lte": cutoff},
+    })
+    if result.deleted_count:
+        print(f"🧹  Cleaned up {result.deleted_count} billing alert(s) older than 2 days", flush=True)
+    return result.deleted_count
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — INVOICES (gym admin view)
