@@ -1425,6 +1425,7 @@ def send_invoice_alert(invoice_id: str, req: InvoiceAlert):
         "scheduled_at":    "",
         "sent_at":         now,
         "invoice_id":      invoice_id,
+        "read":            False,
     })
 
     print(f"✅  Alert sent for invoice {inv['invoice_number']} → {req.alert_type}", flush=True)
@@ -1491,6 +1492,40 @@ def gym_billing_summary(gym_id: str):
         "pending_count":     len(pending),
         "overdue_count":     len(overdue),
     }
+
+
+@app.get("/gym/{gym_id}/notifications/unread-billing-count")
+def gym_unread_billing_count(gym_id: str):
+    """
+    Lightweight count for the sidebar Billing badge's "unread alerts" half.
+    Docs created before the `read` field existed are treated as unread
+    (missing read == not yet seen), so nothing old silently disappears.
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    count = col_notifs.count_documents({
+        "gym_id": gym_id,
+        "type":   "billing",
+        "read":   {"$ne": True},
+    })
+    return {"unread": count}
+
+
+@app.post("/gym/{gym_id}/notifications/mark-billing-read")
+def mark_billing_notifications_read(gym_id: str):
+    """
+    Called once when the gym admin opens the Billing tab — marks every
+    billing notification for this gym as read so the "unread alerts" half
+    of the sidebar badge clears. The "pending invoices" half of the badge
+    is untouched here; that only drops when an invoice is actually paid.
+    """
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    result = col_notifs.update_many(
+        {"gym_id": gym_id, "type": "billing", "read": {"$ne": True}},
+        {"$set": {"read": True, "read_at": datetime.now(timezone.utc)}},
+    )
+    return {"status": "ok", "updated": result.modified_count}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Gym invoice payment — gym admin pays Aerofit directly via Razorpay
@@ -1628,6 +1663,7 @@ def verify_invoice_payment(gym_id: str, invoice_id: str, req: InvoicePaymentVeri
         "scheduled_at":    "",
         "sent_at":         now,
         "invoice_id":      invoice_id,
+        "read":            False,
     })
 
     print(f"✅  Invoice {inv['invoice_number']} paid via Razorpay → pid={req.razorpay_payment_id}", flush=True)
