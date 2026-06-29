@@ -977,6 +977,12 @@ class InvoiceAlert(BaseModel):
 class UpdateUserIdPlan(BaseModel):
     plan_months: int
 
+# ── Gym invoice payment (Razorpay — gym admin pays Aerofit) ──────────────────
+class InvoicePaymentVerify(BaseModel):
+    razorpay_order_id:   str
+    razorpay_payment_id: str
+    razorpay_signature:  str
+
 class FcmTokenUpdate(BaseModel):
     fcm_token: str
     gym_id:    str
@@ -1484,6 +1490,151 @@ def gym_billing_summary(gym_id: str):
         "paid_count":        len(paid),
         "pending_count":     len(pending),
         "overdue_count":     len(overdue),
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Gym invoice payment — gym admin pays Aerofit directly via Razorpay
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/gym/{gym_id}/invoices/{invoice_id}/create-payment-order")
+def create_invoice_payment_order(gym_id: str, invoice_id: str):
+    """
+    Gym admin clicks "Pay Now" on a pending invoice → this creates a
+    Razorpay order for the EXACT invoice.gross amount (never trusts a
+    client-supplied amount) and returns checkout details for the
+    Razorpay widget on the frontend.
+    """
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    inv = col_invoices.find_one({"invoice_id": invoice_id, "gym_id": gym_id})
+    if not inv:
+        raise HTTPException(404, "Invoice not found for this gym")
+
+    if inv.get("status") == "paid":
+        raise HTTPException(400, "This invoice has already been paid")
+    if inv.get("status") == "cancelled":
+        raise HTTPException(400, "This invoice has been cancelled")
+
+    # Reuse an existing pending Razorpay order for this invoice if one was
+    # already created (e.g. admin opened checkout, closed it, clicked again) —
+    # avoids creating duplicate orders on the Razorpay side.
+    existing_order_id = inv.get("razorpay_order_id")
+    if existing_order_id:
+        try:
+            rp_order = razorpay_client.order.fetch(existing_order_id)
+            if rp_order.get("status") == "created":
+                return {
+                    "order_id":      existing_order_id,
+                    "key_id":        RAZORPAY_KEY_ID,
+                    "amount":        rp_order["amount"],
+                    "currency":      "INR",
+                    "name":          "AERO-FIT",
+                    "description":   f"Invoice {inv['invoice_number']} — {inv['period']}",
+                    "prefill_email": gym.get("admin_email", ""),
+                    "prefill_name":  gym.get("name", ""),
+                    "invoice_number": inv["invoice_number"],
+                }
+        except Exception:
+            pass  # fall through and create a fresh order below
+
+    amount_paise = int(round(inv["gross"] * 100))
+    now = datetime.now(timezone.utc)
+
+    try:
+        rp_order = razorpay_client.order.create({
+            "amount":   amount_paise,
+            "currency": "INR",
+            "receipt":  f"inv_{invoice_id[:16]}_{now.strftime('%m%d%H%M%S')}",
+            "notes":    {
+                "invoice_id":     invoice_id,
+                "invoice_number": inv["invoice_number"],
+                "gym_id":         gym_id,
+            },
+        })
+    except Exception as e:
+        print(f"❌  Razorpay invoice-order creation failed: {e}", flush=True)
+        raise HTTPException(502, "Payment gateway error. Please try again.")
+
+    order_id = rp_order["id"]
+    col_invoices.update_one(
+        {"invoice_id": invoice_id},
+        {"$set": {"razorpay_order_id": order_id, "razorpay_order_created_at": now}},
+    )
+
+    print(f"✅  Invoice payment order created → {order_id}  invoice={inv['invoice_number']}  ₹{inv['gross']}", flush=True)
+    return {
+        "order_id":       order_id,
+        "key_id":         RAZORPAY_KEY_ID,
+        "amount":         amount_paise,
+        "currency":       "INR",
+        "name":           "AERO-FIT",
+        "description":    f"Invoice {inv['invoice_number']} — {inv['period']}",
+        "prefill_email":  gym.get("admin_email", ""),
+        "prefill_name":   gym.get("name", ""),
+        "invoice_number": inv["invoice_number"],
+    }
+
+
+@app.post("/gym/{gym_id}/invoices/{invoice_id}/verify-payment")
+def verify_invoice_payment(gym_id: str, invoice_id: str, req: InvoicePaymentVerify):
+    """
+    Verifies the Razorpay payment signature server-side (never trusts the
+    frontend's word that payment succeeded), then marks the invoice paid,
+    credits gym revenue, and raises a receipt notification — mirroring
+    exactly what /alpha/invoices/{id}/status does when super admin marks
+    an invoice paid manually, so both paths stay consistent.
+    """
+    if not _verify_hmac(req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature):
+        raise HTTPException(400, "Payment verification failed. Signature mismatch.")
+
+    inv = col_invoices.find_one({"invoice_id": invoice_id, "gym_id": gym_id})
+    if not inv:
+        raise HTTPException(404, "Invoice not found for this gym")
+
+    if inv.get("status") == "paid":
+        # Already processed (e.g. duplicate webhook/retry) — idempotent success.
+        return {"status": "already_paid", "invoice_id": invoice_id}
+
+    if inv.get("razorpay_order_id") != req.razorpay_order_id:
+        raise HTTPException(400, "Order ID does not match this invoice")
+
+    now = datetime.now(timezone.utc)
+    col_invoices.update_one(
+        {"invoice_id": invoice_id},
+        {"$set": {
+            "status":              "paid",
+            "paid_at":             now,
+            "payment_ref":         req.razorpay_payment_id,
+            "payment_method":      "razorpay",
+            "updated_at":          now,
+        }},
+    )
+
+    col_gyms.update_one(
+        {"gym_id": gym_id},
+        {"$inc": {"revenue": inv.get("gym_amount", 0)}},
+    )
+
+    col_notifs.insert_one({
+        "notification_id": str(uuid.uuid4()),
+        "gym_id":          gym_id,
+        "title":           f"✅ Payment Received — {inv['invoice_number']}",
+        "body":            f"Your payment of ₹{inv['gross']:,.0f} for invoice {inv['invoice_number']} ({inv['period']}) was received via Razorpay. Thank you!",
+        "type":            "billing",
+        "segments":        ["admin"],
+        "deep_link":       f"aerofit://billing/invoice/{invoice_id}",
+        "scheduled_at":    "",
+        "sent_at":         now,
+        "invoice_id":      invoice_id,
+    })
+
+    print(f"✅  Invoice {inv['invoice_number']} paid via Razorpay → pid={req.razorpay_payment_id}", flush=True)
+    return {
+        "status":     "paid",
+        "invoice_id": invoice_id,
+        "paid_at":    now.isoformat(),
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
