@@ -64,8 +64,27 @@ ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 PLATFORM_SHARE_PCT = 40
 GYM_SHARE_PCT      = 60
 
-INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/month
-INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month
+INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/month — Android/Razorpay
+INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month — Android/Razorpay
+
+# ── iOS / Apple In-App Purchase pricing ──────────────────────────────────────
+# Apple's App Store pricing is flat per-month with NO multi-month discount —
+# this must match exactly what's configured for each product in App Store
+# Connect (aerofit_indie_1m/3m/6m/12m), since Apple owns the actual charge.
+# This backend constant is only used to (a) display pricing before purchase
+# and (b) sanity-check receipts; it never creates a Razorpay order.
+IOS_INDIE_BASE_PRICE = float(os.environ.get("IOS_INDIE_BASE_PRICE", "199"))  # ₹/month — Apple IAP only
+
+APPLE_SHARED_SECRET     = os.environ.get("APPLE_SHARED_SECRET", "").strip()
+APPLE_VERIFY_URL_PROD    = "https://buy.itunes.apple.com/verifyReceipt"
+APPLE_VERIFY_URL_SANDBOX = "https://sandbox.itunes.apple.com/verifyReceipt"
+
+APPLE_PRODUCT_MONTHS = {
+    "aerofit_indie_1m":  1,
+    "aerofit_indie_3m":  3,
+    "aerofit_indie_6m":  6,
+    "aerofit_indie_12m": 12,
+}
 
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 print(f"✅  Razorpay configured → key {RAZORPAY_KEY_ID[:12]}…", flush=True)
@@ -103,6 +122,8 @@ col_payments:    Collection = mdb["indie_payments"]
 col_password_resets: Collection = mdb["password_resets"]
 col_signup_otps: Collection = mdb["indie_signup_otps"]
 col_indie_notifs: Collection = mdb["indie_notifications"]
+col_apple_pending:      Collection = mdb["indie_apple_pending_signups"]
+col_apple_transactions: Collection = mdb["indie_apple_transactions"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
@@ -135,6 +156,10 @@ col_signup_otps.create_index("expires_at")
 col_indie_notifs.create_index([("email", 1), ("sent_at", -1)])
 col_indie_notifs.create_index([("email", 1), ("alert_key", 1)], unique=True)
 col_indie_notifs.create_index("read")
+col_apple_pending.create_index("email", unique=True)
+col_apple_pending.create_index("expires_at")
+col_apple_transactions.create_index("transaction_id", unique=True)
+col_apple_transactions.create_index("email")
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -292,6 +317,7 @@ def _generate_code() -> str:
     return "AF-" + "".join(__import__("random").choice(chars) for _ in range(4))
 
 def _indie_pricing(months: int) -> dict:
+    """Android / Razorpay pricing — has the multi-month discount."""
     months       = max(1, min(months, 12))
     discount_pct = (months - 1) * INDIE_DISCOUNT_PCT
     gross_inr    = round(INDIE_BASE_PRICE * months, 2)
@@ -307,6 +333,25 @@ def _indie_pricing(months: int) -> dict:
         "final_paise":  int(final_inr * 100),
     }
 
+def _indie_pricing_ios(months: int) -> dict:
+    """
+    iOS / Apple IAP pricing — flat ₹199/month, NO multi-month discount.
+    e.g. 1mo = ₹199, 3mo = ₹597, 6mo = ₹1194, 12mo = ₹2388.
+    Must mirror what's configured for each product in App Store Connect —
+    this is used for display/estimate only; Apple owns the actual charge.
+    """
+    months    = max(1, min(months, 12))
+    final_inr = round(IOS_INDIE_BASE_PRICE * months, 2)
+    return {
+        "months":       months,
+        "base_price":   IOS_INDIE_BASE_PRICE,
+        "gross_inr":    final_inr,
+        "discount_pct": 0,
+        "discount_inr": 0,
+        "final_inr":    final_inr,
+        "final_paise":  int(final_inr * 100),
+    }
+
 def _verify_hmac(order_id: str, payment_id: str, signature: str) -> bool:
     msg      = f"{order_id}|{payment_id}"
     expected = hmac.new(
@@ -315,6 +360,54 @@ def _verify_hmac(order_id: str, payment_id: str, signature: str) -> bool:
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+def _verify_apple_receipt(receipt_data: str) -> dict:
+    """
+    Validates a StoreKit receipt against Apple's verifyReceipt endpoint.
+    Tries production first; if Apple returns status 21007 ("this receipt
+    is from the test environment"), retries against sandbox — Apple's
+    documented pattern, so TestFlight/dev builds and real purchases both
+    work without branching client-side.
+    """
+    if not APPLE_SHARED_SECRET:
+        raise HTTPException(500, "Apple receipt verification is not configured on the server")
+
+    payload = {
+        "receipt-data": receipt_data,
+        "password": APPLE_SHARED_SECRET,
+        "exclude-old-transactions": True,
+    }
+
+    def _call(url: str) -> dict:
+        return http_requests.post(url, json=payload, timeout=15).json()
+
+    result = _call(APPLE_VERIFY_URL_PROD)
+    if result.get("status") == 21007:
+        result = _call(APPLE_VERIFY_URL_SANDBOX)
+
+    if result.get("status") != 0:
+        print(f"⚠️  Apple receipt verification failed → status={result.get('status')}", flush=True)
+        raise HTTPException(400, f"Apple receipt verification failed (status {result.get('status')})")
+    return result
+
+
+def _find_apple_transaction(receipt_json: dict, transaction_id: str, product_id: str) -> dict:
+    """
+    Finds the specific transaction in a verified receipt and cross-checks
+    product_id against what Apple recorded — never trust the client's
+    claimed product_id alone.
+    """
+    candidates = (
+        receipt_json.get("latest_receipt_info")
+        or receipt_json.get("receipt", {}).get("in_app", [])
+        or []
+    )
+    for txn in candidates:
+        if txn.get("transaction_id") == transaction_id:
+            if txn.get("product_id") != product_id:
+                raise HTTPException(400, "Product ID does not match the verified transaction")
+            return txn
+    raise HTTPException(400, "Transaction not found in verified Apple receipt")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BILLING HELPERS
@@ -835,11 +928,12 @@ print("✅  Background threads started (keep-alive + expiry job)", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="18.0.0")
+app = FastAPI(title="AERO-FIT API", version="19.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
     "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:3000",
+    "https://aryan212004.github.io",
     # "https://your-admin-dashboard.vercel.app",  ← uncomment and add your URL
 ]
 
@@ -987,7 +1081,7 @@ class FcmTokenUpdate(BaseModel):
     fcm_token: str
     gym_id:    str
 
-# ── Indie (independent) payment models ───────────────────────────────────────
+# ── Indie (independent) payment models — Android / Razorpay ─────────────────
 class IndieOrderRequest(BaseModel):
     months:    int
     email:     str
@@ -1024,6 +1118,20 @@ class IndieVerifySignupOtpRequest(BaseModel):
     email: str
     otp:   str
 
+# ── Indie (independent) payment models — iOS / Apple IAP ────────────────────
+class ApplePrepareSignupRequest(BaseModel):
+    email:     str
+    name:      str
+    password:  str
+    weight_kg: float
+    height_cm: float
+
+class AppleVerifyRequest(BaseModel):
+    email:          str
+    receipt_data:   str
+    product_id:     str
+    transaction_id: str
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1032,7 +1140,7 @@ class IndieVerifySignupOtpRequest(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "18.0.0",
+        "version":        "19.0.0",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -1913,6 +2021,7 @@ def list_all_members():
             "indie_expires_at":   _fmt_dt(d.get("indie_expires_at")) if is_indie else None,
             "expires_at":         expires_at,
             "created_at":         _fmt_dt(d.get("created_at")),
+            "payment_platform":   d.get("payment_platform", "razorpay" if is_indie else ""),
         })
 
     return result
@@ -1998,6 +2107,7 @@ def user_login(req: UserLogin):
             "plan_label":         user.get("plan_label", "1 Month"),
             "membership_expired": expired_flag,
             "membership_expires": membership_expires,
+            "payment_platform":   user.get("payment_platform", ""),
         },
     }
 
@@ -2035,6 +2145,7 @@ def get_user(email: str):
         "plan_label":         user.get("plan_label", "1 Month"),
         "membership_expired": user.get("membership_expired", False),
         "membership_expires": membership_expires,
+        "payment_platform":   user.get("payment_platform", ""),
     }
 
 @app.put("/user/{email}")
@@ -2174,6 +2285,7 @@ def indie_billing_status(email: str):
         "indie_expires_at":      _fmt_dt(expires_at) if expires_at else None,
         "membership_expired":    user.get("membership_expired", False),
         "grace_period_ends_at":  _fmt_dt(grace_ends) if grace_ends else None,
+        "payment_platform":      user.get("payment_platform", "razorpay"),
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2499,11 +2611,12 @@ def delete_meal(meal_id: str):
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — INDIE PLAN (Razorpay — independent users only)
+#  ROUTES — INDIE PLAN — ANDROID / RAZORPAY (independent users)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/indie/pricing/{months}")
 def indie_pricing(months: int):
+    """Android pricing — ₹159/month base, with multi-month discount."""
     if months < 1 or months > 12:
         raise HTTPException(400, "months must be 1–12")
     return _indie_pricing(months)
@@ -2685,6 +2798,7 @@ def indie_verify_payment(req: IndieVerifyRequest):
         "indie_expires_at":   expires_at,
         "membership_expired": False,
         "created_at":         now,
+        "payment_platform":   "razorpay",
     })
 
     col_payments.update_one(
@@ -2712,6 +2826,7 @@ def indie_verify_payment(req: IndieVerifyRequest):
             "indie_expires_at":   expires_at.isoformat(),
             "membership_expired": False,
             "membership_expires": expires_at.isoformat(),
+            "payment_platform":   "razorpay",
         },
     }
 
@@ -2807,6 +2922,7 @@ def indie_verify_renewal(req: IndieVerifyRequest):
                 "membership_expired": False,
                 "plan_months":        months,
                 "plan_label":         f"{months} Month{'s' if months > 1 else ''}",
+                "payment_platform":   "razorpay",
             },
             "$unset": {
                 "membership_expired_at": "",
@@ -2856,6 +2972,218 @@ def indie_payment_status(order_id: str):
         "months":     doc.get("months"),
         "amount_inr": doc.get("amount_inr"),
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — INDIE PLAN — iOS / APPLE IN-APP PURCHASE (independent users)
+#  Pricing: flat ₹199/month, NO multi-month discount (matches App Store
+#  Connect product prices for aerofit_indie_1m/3m/6m/12m). Android keeps
+#  its separate ₹159/month + discount pricing via /indie/pricing/{months}.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/indie/apple/pricing/{months}")
+def indie_pricing_ios(months: int):
+    """iOS display pricing — ₹199/month flat, e.g. 3mo = ₹597, 12mo = ₹2388."""
+    if months < 1 or months > 12:
+        raise HTTPException(400, "months must be 1–12")
+    return _indie_pricing_ios(months)
+
+
+@app.post("/indie/apple/prepare-signup")
+def apple_prepare_signup(req: ApplePrepareSignupRequest):
+    """
+    Step 1 of iOS signup: stash the account form data before the StoreKit
+    purchase sheet opens. Apple's receipt only proves what was bought, not
+    who's signing up, so we park name/password/weight/height here first.
+    """
+    email = req.email.strip().lower()
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
+        raise HTTPException(400, "Invalid email address")
+    if col_users.find_one({"email": email}):
+        raise HTTPException(409, "An account with this email already exists")
+
+    now = datetime.now(timezone.utc)
+    hashed_pw = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+
+    col_apple_pending.update_one(
+        {"email": email},
+        {"$set": {
+            "email": email,
+            "name": req.name.strip(),
+            "password": hashed_pw,
+            "weight_kg": req.weight_kg,
+            "height_cm": req.height_cm,
+            "created_at": now,
+            "expires_at": now + timedelta(hours=1),
+        }},
+        upsert=True,
+    )
+    print(f"✅  Apple pending signup stashed → {email}", flush=True)
+    return {"status": "ok"}
+
+
+@app.post("/indie/apple/verify-signup")
+def apple_verify_signup(req: AppleVerifyRequest):
+    """
+    Step 2: called once StoreKit reports 'purchased'/'restored'. Verifies
+    the receipt with Apple, dedupes on transaction_id, then creates the
+    account from the data stashed in prepare-signup. Plan months are
+    derived from the verified product_id — never trusted from the client
+    beyond what Apple's receipt confirms.
+    """
+    email = req.email.strip().lower()
+
+    pending = col_apple_pending.find_one({"email": email})
+    if not pending:
+        raise HTTPException(400, "No pending signup found for this email. Please start over.")
+    if _ensure_utc(pending["expires_at"]) <= datetime.now(timezone.utc):
+        col_apple_pending.delete_one({"email": email})
+        raise HTTPException(400, "Signup session expired. Please start over.")
+    if col_users.find_one({"email": email}):
+        raise HTTPException(409, "Account already exists for this email")
+    if col_apple_transactions.find_one({"transaction_id": req.transaction_id}):
+        raise HTTPException(409, "This purchase has already been processed")
+
+    months = APPLE_PRODUCT_MONTHS.get(req.product_id)
+    if months is None:
+        raise HTTPException(400, "Unknown product ID")
+
+    receipt_json = _verify_apple_receipt(req.receipt_data)
+    _find_apple_transaction(receipt_json, req.transaction_id, req.product_id)
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=30 * months)
+    pricing = _indie_pricing_ios(months)
+
+    col_users.insert_one({
+        "email": email,
+        "name": pending["name"],
+        "password": pending["password"],
+        "weight_kg": pending["weight_kg"],
+        "height_cm": pending["height_cm"],
+        "gym_id": None,
+        "plan_months": months,
+        "plan_label": f"{months} Month{'s' if months > 1 else ''}",
+        "indie_plan": True,
+        "indie_expires_at": expires_at,
+        "membership_expired": False,
+        "created_at": now,
+        "payment_platform": "apple",
+    })
+    col_apple_transactions.insert_one({
+        "transaction_id": req.transaction_id,
+        "product_id": req.product_id,
+        "email": email,
+        "type": "new",
+        "amount_inr": pricing["final_inr"],
+        "verified_at": now,
+    })
+    col_apple_pending.delete_one({"email": email})
+
+    print(f"✅  Apple signup verified → {email}  {months}mo  ₹{pricing['final_inr']}  txn={req.transaction_id}", flush=True)
+    return {
+        "status": "ok",
+        "user": {
+            "email": email,
+            "name": pending["name"],
+            "weight_kg": pending["weight_kg"],
+            "height_cm": pending["height_cm"],
+            "gym_id": None,
+            "gym_name": "",
+            "indie_plan": True,
+            "plan_months": months,
+            "plan_label": f"{months} Month{'s' if months > 1 else ''}",
+            "indie_expires_at": expires_at.isoformat(),
+            "membership_expired": False,
+            "membership_expires": expires_at.isoformat(),
+            "payment_platform": "apple",
+        },
+    }
+
+
+@app.post("/indie/apple/verify-renewal")
+def apple_verify_renewal(req: AppleVerifyRequest):
+    """
+    Verifies the receipt, dedupes on transaction_id, extends
+    indie_expires_at — same stacking logic as the Razorpay renewal path.
+    """
+    email = req.email.strip().lower()
+    user = col_users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+    if not user.get("indie_plan"):
+        raise HTTPException(400, "Only independent plan users can renew here")
+    if col_apple_transactions.find_one({"transaction_id": req.transaction_id}):
+        raise HTTPException(409, "This purchase has already been processed")
+
+    months = APPLE_PRODUCT_MONTHS.get(req.product_id)
+    if months is None:
+        raise HTTPException(400, "Unknown product ID")
+
+    receipt_json = _verify_apple_receipt(req.receipt_data)
+    _find_apple_transaction(receipt_json, req.transaction_id, req.product_id)
+
+    now = datetime.now(timezone.utc)
+    current_exp = _ensure_utc(user.get("indie_expires_at"))
+    base = current_exp if (current_exp and current_exp > now) else now
+    new_exp = base + timedelta(days=30 * months)
+    pricing = _indie_pricing_ios(months)
+
+    col_users.update_one(
+        {"email": email},
+        {
+            "$set": {
+                "indie_expires_at": new_exp,
+                "membership_expired": False,
+                "plan_months": months,
+                "plan_label": f"{months} Month{'s' if months > 1 else ''}",
+                "payment_platform": "apple",
+            },
+            "$unset": {"membership_expired_at": "", "grace_period_ends_at": ""},
+        },
+    )
+    col_apple_transactions.insert_one({
+        "transaction_id": req.transaction_id,
+        "product_id": req.product_id,
+        "email": email,
+        "type": "renewal",
+        "amount_inr": pricing["final_inr"],
+        "verified_at": now,
+    })
+
+    print(f"✅  Apple renewal verified → {email}  {months}mo  ₹{pricing['final_inr']}  new expiry: {new_exp.isoformat()}  txn={req.transaction_id}", flush=True)
+
+    _create_indie_alert(
+        email=email,
+        alert_key=f"renewed_{req.transaction_id}",
+        alert_type="renewed",
+        title="✅ Plan renewed",
+        body=f"Your AERO-FIT plan is now active until {new_exp.strftime('%d %b %Y')}.",
+    )
+    return {
+        "status": "renewed",
+        "email": email,
+        "months": months,
+        "new_expires_at": new_exp.isoformat(),
+        "membership_expires": new_exp.isoformat(),
+    }
+
+
+@app.get("/indie/apple/payment-status/{transaction_id}")
+def apple_payment_status(transaction_id: str):
+    doc = col_apple_transactions.find_one({"transaction_id": transaction_id})
+    if not doc:
+        raise HTTPException(404, "Transaction not found")
+    return {
+        "transaction_id": transaction_id,
+        "type":            doc.get("type"),
+        "email":           doc.get("email"),
+        "product_id":      doc.get("product_id"),
+        "amount_inr":      doc.get("amount_inr"),
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — PASSWORD RESET
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/auth/forgot-password")
 def forgot_password(req: ForgotPasswordRequest):
