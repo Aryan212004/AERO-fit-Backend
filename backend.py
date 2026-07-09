@@ -989,6 +989,9 @@ class UserUpdate(BaseModel):
     weight_kg: Optional[float] = None
     height_cm: Optional[float] = None
 
+class DeleteAccountRequest(BaseModel):
+    password: str
+
 class MealRequest(BaseModel):
     image_base64: str
     email:        str = ""
@@ -2258,6 +2261,41 @@ def membership_status(email: str):
         return {"valid": True, "reason": "active", "expires_at": _fmt_dt(expires_at)}
 
     return {"valid": True, "reason": "active"}
+
+@app.post("/user/{email}/delete-account")
+def delete_own_account(email: str, req: DeleteAccountRequest):
+    """
+    Self-service account deletion (Apple Guideline 5.1.1(v)). Requires the
+    user's current password so a stolen session token alone can't wipe an
+    account. Gym members have their User ID slot released back to the gym
+    instead of deleting the gym's data; indie users are fully removed.
+    """
+    email = email.strip().lower()
+    user = col_users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "User not found")
+    if not user.get("password") or not bcrypt.checkpw(
+        req.password.encode(), user["password"].encode()
+    ):
+        raise HTTPException(401, "Incorrect password")
+
+    gym_id = user.get("gym_id")
+    if gym_id:
+        uid_doc = col_user_ids.find_one({"used_by": email, "gym_id": gym_id})
+        if uid_doc:
+            col_user_ids.delete_one({"_id": uid_doc["_id"]})
+            col_gyms.update_one(
+                {"gym_id": gym_id, "members": {"$gt": 0}},
+                {"$inc": {"members": -1}},
+            )
+
+    col_meals.delete_many({"email": email})
+    col_scan_limits.delete_many({"email": email})
+    col_indie_notifs.delete_many({"email": email})
+    col_users.delete_one({"email": email})
+
+    print(f"🗑️  Self-service account deletion → {email}", flush=True)
+    return {"status": "deleted"}
 
 @app.get("/indie/billing-status/{email}")
 def indie_billing_status(email: str):
