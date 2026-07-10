@@ -76,6 +76,10 @@ INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per
 IOS_INDIE_BASE_PRICE = float(os.environ.get("IOS_INDIE_BASE_PRICE", "199"))  # ₹/month — Apple IAP only
 
 APPLE_SHARED_SECRET     = os.environ.get("APPLE_SHARED_SECRET", "").strip()
+if APPLE_SHARED_SECRET:
+    print(f"✅  Apple shared secret configured → {APPLE_SHARED_SECRET[:6]}…", flush=True)
+else:
+    print("⚠️  APPLE_SHARED_SECRET not set — Apple IAP purchases will fail verification", flush=True)
 APPLE_VERIFY_URL_PROD    = "https://buy.itunes.apple.com/verifyReceipt"
 APPLE_VERIFY_URL_SANDBOX = "https://sandbox.itunes.apple.com/verifyReceipt"
 
