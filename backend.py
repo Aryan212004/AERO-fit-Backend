@@ -1403,12 +1403,6 @@ def delete_gym(gym_id: str):
 
 @app.get("/gym/{gym_id}/pro-activation-status")
 def pro_activation_status(gym_id: str):
-    """
-    Called immediately after gym-admin login. Tells the frontend whether
-    the entire admin dashboard should be blocked behind the activation
-    paywall. Only Pro-plan gyms are gated — Trial gyms run on their own
-    14-day auto-delete window instead and are never gated here.
-    """
     gym = col_gyms.find_one({"gym_id": gym_id})
     if not gym:
         raise HTTPException(404, "Gym not found")
@@ -1421,7 +1415,13 @@ def pro_activation_status(gym_id: str):
     expires_at = _ensure_utc(gym.get("pro_fee_expires_at"))
 
     if paid and expires_at and expires_at > now:
-        return {"required": False, "expires_at": _fmt_dt(expires_at)}
+        days_left = (expires_at - now).days
+        return {
+            "required":      False,
+            "expires_at":    _fmt_dt(expires_at),
+            "days_left":     days_left,
+            "expiring_soon": days_left <= 15,   # ← new
+        }
 
     return {
         "required": True,
