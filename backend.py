@@ -64,6 +64,12 @@ ALPHA_PASSWORD = os.environ.get("ALPHA_PASSWORD", "aerofit_alpha_2025").strip()
 PLATFORM_SHARE_PCT = 40
 GYM_SHARE_PCT      = 60
 
+# ── Pro plan admin-dashboard activation fee (super-admin created Pro gyms) ───
+# Charged once at first gym-admin login, then annually thereafter. Gates the
+# ENTIRE admin dashboard (banners, notifications, User IDs, everything) until
+# paid — see /gym/{gym_id}/pro-activation-status and friends below.
+PRO_ACTIVATION_FEE_INR = float(os.environ.get("PRO_ACTIVATION_FEE_INR", "5000"))  # ₹/year
+
 INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/month — Android/Razorpay
 INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month — Android/Razorpay
 
@@ -946,7 +952,7 @@ print("✅  Background threads started (keep-alive + expiry job)", flush=True)
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="19.0.0")
+app = FastAPI(title="AERO-FIT API", version="20.0.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -1166,7 +1172,7 @@ class AppleVerifyRequest(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "19.0.0",
+        "version":        "20.0.0",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -1275,6 +1281,9 @@ def create_gym(req: GymCreate):
         "pro_fee_paid":      False,
         "pro_fee_paid_at":   None,
         "pro_fee_expires_at": None,
+        "pro_activation_razorpay_order_id": None,
+        "pro_activation_order_created_at":  None,
+        "pro_fee_last_payment_ref": None,
         "created_at":        now,
     })
 
@@ -1385,6 +1394,153 @@ def delete_gym(gym_id: str):
         "status":  "deleted",
         "gym_id":  gym_id,
         "deleted": summary,
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — PRO PLAN ACTIVATION (₹5,000/year — required before a Pro gym's
+#  admin can access the dashboard; checked on every login, no bypass)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/gym/{gym_id}/pro-activation-status")
+def pro_activation_status(gym_id: str):
+    """
+    Called immediately after gym-admin login. Tells the frontend whether
+    the entire admin dashboard should be blocked behind the activation
+    paywall. Only Pro-plan gyms are gated — Trial gyms run on their own
+    14-day auto-delete window instead and are never gated here.
+    """
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    if gym.get("plan") != "Pro":
+        return {"required": False}
+
+    now        = datetime.now(timezone.utc)
+    paid       = gym.get("pro_fee_paid", False)
+    expires_at = _ensure_utc(gym.get("pro_fee_expires_at"))
+
+    if paid and expires_at and expires_at > now:
+        return {"required": False, "expires_at": _fmt_dt(expires_at)}
+
+    return {
+        "required": True,
+        "amount":   PRO_ACTIVATION_FEE_INR,
+        "expired":  bool(paid and expires_at and expires_at <= now),
+    }
+
+
+@app.post("/gym/{gym_id}/pro-activation/create-order")
+def pro_activation_create_order(gym_id: str):
+    """
+    Creates a Razorpay order for the fixed ₹5,000/year fee. Reuses an
+    existing unpaid order if one is still open, same pattern as invoice
+    payment orders, so repeated "Pay" clicks don't spam Razorpay.
+    """
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+    if gym.get("plan") != "Pro":
+        raise HTTPException(400, "Activation fee only applies to Pro plan gyms")
+
+    now        = datetime.now(timezone.utc)
+    expires_at = _ensure_utc(gym.get("pro_fee_expires_at"))
+    if gym.get("pro_fee_paid") and expires_at and expires_at > now:
+        raise HTTPException(400, "Pro plan is already active")
+
+    admin = col_gym_admins.find_one({"gym_id": gym_id})
+
+    existing_order_id = gym.get("pro_activation_razorpay_order_id")
+    if existing_order_id:
+        try:
+            rp_order = razorpay_client.order.fetch(existing_order_id)
+            if rp_order.get("status") == "created":
+                return {
+                    "order_id":      existing_order_id,
+                    "key_id":        RAZORPAY_KEY_ID,
+                    "amount":        rp_order["amount"],
+                    "currency":      "INR",
+                    "name":          "AERO-FIT",
+                    "description":   f"Pro Plan Activation — {gym['name']} (1 year)",
+                    "prefill_email": (admin or {}).get("email", gym.get("admin_email", "")),
+                    "prefill_name":  gym.get("name", ""),
+                }
+        except Exception:
+            pass  # fall through and create a fresh order below
+
+    amount_paise = int(round(PRO_ACTIVATION_FEE_INR * 100))
+
+    try:
+        rp_order = razorpay_client.order.create({
+            "amount":   amount_paise,
+            "currency": "INR",
+            "receipt":  f"proact_{gym_id[:16]}_{now.strftime('%m%d%H%M%S')}",
+            "notes":    {"gym_id": gym_id, "purpose": "pro_activation"},
+        })
+    except Exception as e:
+        print(f"❌  Razorpay pro-activation order creation failed: {e}", flush=True)
+        raise HTTPException(502, "Payment gateway error. Please try again.")
+
+    order_id = rp_order["id"]
+    col_gyms.update_one(
+        {"gym_id": gym_id},
+        {"$set": {
+            "pro_activation_razorpay_order_id": order_id,
+            "pro_activation_order_created_at":  now,
+        }},
+    )
+
+    print(f"✅  Pro activation order created → {order_id}  gym={gym_id}  ₹{PRO_ACTIVATION_FEE_INR}", flush=True)
+    return {
+        "order_id":      order_id,
+        "key_id":        RAZORPAY_KEY_ID,
+        "amount":        amount_paise,
+        "currency":      "INR",
+        "name":          "AERO-FIT",
+        "description":   f"Pro Plan Activation — {gym['name']} (1 year)",
+        "prefill_email": (admin or {}).get("email", gym.get("admin_email", "")),
+        "prefill_name":  gym.get("name", ""),
+    }
+
+
+@app.post("/gym/{gym_id}/pro-activation/verify-payment")
+def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
+    """
+    Verifies the Razorpay payment signature server-side, then unlocks the
+    dashboard for exactly 1 year. If the admin is renewing before expiry,
+    the extra year stacks on top of the current expiry (same pattern as
+    indie plan renewals) rather than resetting from "now".
+    """
+    if not _verify_hmac(req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature):
+        raise HTTPException(400, "Payment verification failed. Signature mismatch.")
+
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    if gym.get("pro_activation_razorpay_order_id") != req.razorpay_order_id:
+        raise HTTPException(400, "Order ID does not match this gym's activation order")
+
+    now            = datetime.now(timezone.utc)
+    current_expiry = _ensure_utc(gym.get("pro_fee_expires_at"))
+    base       = current_expiry if (current_expiry and current_expiry > now) else now
+    new_expiry = base + timedelta(days=365)
+
+    col_gyms.update_one(
+        {"gym_id": gym_id},
+        {"$set": {
+            "pro_fee_paid":             True,
+            "pro_fee_paid_at":          now,
+            "pro_fee_expires_at":       new_expiry,
+            "pro_fee_last_payment_ref": req.razorpay_payment_id,
+        }},
+    )
+
+    print(f"✅  Pro activation paid → gym={gym_id}  pid={req.razorpay_payment_id}  valid until {new_expiry.isoformat()}", flush=True)
+    return {
+        "status":     "activated",
+        "gym_id":     gym_id,
+        "expires_at": new_expiry.isoformat(),
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
