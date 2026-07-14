@@ -904,6 +904,20 @@ def _run_expiry_job():
                     ),
                 )
 
+            # ── 1b. Trial gyms past their 14-day window → auto-delete ──────────
+            expired_trials = list(col_gyms.find({
+                "status":            "trial",
+                "trial_expires_at":  {"$lte": now},
+            }))
+
+            if expired_trials:
+                print(f"🗑️  Expiry job: {len(expired_trials)} trial gym(s) past 14 days — deleting", flush=True)
+
+            for gym in expired_trials:
+                gid = gym.get("gym_id")
+                print(f"   ↳ Auto-deleting expired trial gym: {gym.get('name')} ({gid})", flush=True)
+                _cascade_delete_gym(gid)
+
             # ── 2c. Indie users past grace period → permanent deletion ─────────
             # Gym members are NEVER auto-deleted — only indie accounts.
             to_delete = list(col_users.find({
@@ -1125,6 +1139,11 @@ class IndieVerifySignupOtpRequest(BaseModel):
     email: str
     otp:   str
 
+class ProActivationVerify(BaseModel):
+    razorpay_order_id:   str
+    razorpay_payment_id: str
+    razorpay_signature:  str
+
 # ── Indie (independent) payment models — iOS / Apple IAP ────────────────────
 class ApplePrepareSignupRequest(BaseModel):
     email:     str
@@ -1239,19 +1258,24 @@ def create_gym(req: GymCreate):
     admin_id = "adm_" + str(uuid.uuid4())[:8]
     raw_pw   = req.admin_password.strip() or re.sub(r"[^a-z0-9]", "", req.name.lower()) + "2025"
     now      = datetime.now(timezone.utc)
+    trial_expires_at = (now + timedelta(days=14)) if req.plan == "Trial" else None
 
     col_gyms.insert_one({
-        "gym_id":         gym_id,
-        "name":           req.name.strip(),
-        "city":           req.city.strip(),
-        "plan":           req.plan,
-        "status":         "trial" if req.plan == "Trial" else "active",
-        "members":        0,
-        "revenue":        0,
-        "price_per_user": req.price_per_user,
-        "admin_email":    admin_email,
-        "admin_id":       admin_id,
-        "created_at":     now,
+        "gym_id":            gym_id,
+        "name":              req.name.strip(),
+        "city":              req.city.strip(),
+        "plan":              req.plan,
+        "status":            "trial" if req.plan == "Trial" else "active",
+        "members":           0,
+        "revenue":           0,
+        "price_per_user":    req.price_per_user,
+        "admin_email":       admin_email,
+        "admin_id":          admin_id,
+        "trial_expires_at":  trial_expires_at,
+        "pro_fee_paid":      False,
+        "pro_fee_paid_at":   None,
+        "pro_fee_expires_at": None,
+        "created_at":        now,
     })
 
     hashed = bcrypt.hashpw(raw_pw.encode(), bcrypt.gensalt()).decode()
@@ -1419,6 +1443,7 @@ def delete_gym_admin(admin_id: str):
     if result.deleted_count == 0:
         raise HTTPException(404, "Admin not found")
     return {"status": "deleted", "admin_id": admin_id}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — INVOICES (super admin — manual gym billing)
