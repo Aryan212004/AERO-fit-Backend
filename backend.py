@@ -958,7 +958,8 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
     "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:3000",
     "https://aryan212004.github.io",
-    # "https://your-admin-dashboard.vercel.app",  ← uncomment and add your URL
+    "https://myfittt.com",
+    "https://www.myfittt.com",
 ]
 
 app.add_middleware(
