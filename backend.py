@@ -68,7 +68,7 @@ GYM_SHARE_PCT      = 60
 # Charged once at first gym-admin login, then annually thereafter. Gates the
 # ENTIRE admin dashboard (banners, notifications, User IDs, everything) until
 # paid — see /gym/{gym_id}/pro-activation-status and friends below.
-PRO_ACTIVATION_FEE_INR = float(os.environ.get("PRO_ACTIVATION_FEE_INR", "5000"))  # ₹/year
+PRO_ACTIVATION_FEE_INR = float(os.environ.get("PRO_ACTIVATION_FEE_INR", "5"))  # ₹/year
 
 INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/month — Android/Razorpay
 INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month — Android/Razorpay
