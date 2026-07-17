@@ -1913,6 +1913,11 @@ def gym_billing_summary(gym_id: str):
     pending  = [i for i in invoices if i.get("status") == "pending"]
     overdue  = [i for i in invoices if i.get("status") == "overdue"]
 
+    next_invoice_at = _ensure_utc(gym.get("billing_cycle_next_invoice_at"))
+    next_billing_days_left = None
+    if next_invoice_at:
+        next_billing_days_left = max(0, (next_invoice_at - datetime.now(timezone.utc)).days)
+
     return {
         "price_per_user":    gym.get("price_per_user", 0),
         "platform_pct":      PLATFORM_SHARE_PCT,
@@ -1926,8 +1931,8 @@ def gym_billing_summary(gym_id: str):
         "paid_count":        len(paid),
         "pending_count":     len(pending),
         "overdue_count":     len(overdue),
-        # ── NEW: next auto-billing date for this gym's monthly Pro cycle ────
-        "next_billing_date": _fmt_dt(gym.get("billing_cycle_next_invoice_at")),
+        "next_billing_date":       _fmt_dt(next_invoice_at),
+        "next_billing_days_left":  next_billing_days_left,
     }
 
 
