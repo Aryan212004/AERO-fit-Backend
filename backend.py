@@ -68,6 +68,8 @@ GYM_SHARE_PCT      = 60
 # Charged once at first gym-admin login, then annually thereafter. Gates the
 # ENTIRE admin dashboard (banners, notifications, User IDs, everything) until
 # paid — see /gym/{gym_id}/pro-activation-status and friends below.
+# NOTE: currently set to "5" for testing — change back to "5000" before going
+# live, and remove the /pro-activation/reset-order debug route below too.
 PRO_ACTIVATION_FEE_INR = float(os.environ.get("PRO_ACTIVATION_FEE_INR", "5"))  # ₹/year
 
 INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/month — Android/Razorpay
@@ -944,9 +946,115 @@ def _run_expiry_job():
         time.sleep(3600)
 
 
-threading.Thread(target=_keep_alive,     daemon=True).start()
-threading.Thread(target=_run_expiry_job, daemon=True).start()
-print("✅  Background threads started (keep-alive + expiry job)", flush=True)
+# ══════════════════════════════════════════════════════════════════════════════
+#  NEW: MONTHLY PRO BILLING JOB
+#  Charges every Pro gym ₹35/member/month, on a rolling monthly cycle
+#  anchored to the date the gym FIRST paid its Pro activation fee.
+#  2 days before each cycle's end date, this auto-generates an invoice and
+#  pushes a billing notification to the gym admin — no super-admin action
+#  needed. Only ever touches Pro gyms; Trial gyms are completely untouched.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_pro_billing_job():
+    """
+    Runs every 6 hours. For each Pro-plan gym with an active monthly
+    billing cycle (billing_cycle_next_invoice_at set — this is stamped the
+    moment the gym FIRST pays its Pro activation fee, see
+    pro_activation_verify_payment):
+
+      1. If we're within 2 days of that gym's cycle-end date and haven't
+         already auto-invoiced for this specific cycle, generate a
+         ₹35/member invoice (due on the cycle-end date) and fire a billing
+         notification to the gym admin.
+      2. Once the cycle-end date itself has passed, roll the cycle forward
+         by another 30 days so this repeats indefinitely, every month.
+    """
+    time.sleep(60)
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            pro_gyms = list(col_gyms.find({
+                "plan": "Pro",
+                "pro_fee_paid": True,
+                "billing_cycle_next_invoice_at": {"$exists": True, "$ne": None},
+            }))
+
+            for gym in pro_gyms:
+                gym_id = gym["gym_id"]
+                next_invoice_at = _ensure_utc(gym.get("billing_cycle_next_invoice_at"))
+                if not next_invoice_at:
+                    continue
+
+                reminder_at = next_invoice_at - timedelta(days=2)
+                already_invoiced = gym.get("billing_cycle_last_invoiced_for") == next_invoice_at.isoformat()
+
+                # ── Auto-generate invoice 2 days before this cycle's end ────────
+                if now >= reminder_at and not already_invoiced:
+                    member_count = col_user_ids.count_documents({"gym_id": gym_id, "status": "used"})
+                    if member_count > 0:
+                        gross = round(AEROFIT_FEE_PER_USER * member_count, 2)
+                        invoice_id = str(uuid.uuid4())
+                        inv_number = _invoice_number()
+                        col_invoices.insert_one({
+                            "invoice_id":       invoice_id,
+                            "invoice_number":   inv_number,
+                            "gym_id":           gym_id,
+                            "gym_name":         gym["name"],
+                            "admin_email":      gym.get("admin_email", ""),
+                            "period":           next_invoice_at.strftime("%B %Y"),
+                            "member_count":     member_count,
+                            "fee_per_user":     AEROFIT_FEE_PER_USER,
+                            "gross":            gross,
+                            "status":           "pending",
+                            "notes":            "Auto-generated monthly Pro billing",
+                            "created_at":       now,
+                            "due_at":           next_invoice_at,
+                            "paid_at":          None,
+                            "payment_ref":      None,
+                            "alerts":           [],
+                            "auto_generated":   True,
+                        })
+                        col_notifs.insert_one({
+                            "notification_id": str(uuid.uuid4()),
+                            "gym_id":          gym_id,
+                            "title":           f"💳 Monthly invoice — {inv_number}",
+                            "body":            f"Your monthly Aerofit invoice for {member_count} member(s) is ₹{gross:,.0f}, due {next_invoice_at.strftime('%d %b %Y')}.",
+                            "type":            "billing",
+                            "segments":        ["admin"],
+                            "deep_link":       f"aerofit://billing/invoice/{invoice_id}",
+                            "scheduled_at":    "",
+                            "sent_at":         now,
+                            "invoice_id":      invoice_id,
+                            "read":            False,
+                        })
+                        print(f"✅  Auto-invoice created → {inv_number}  gym={gym_id}  {member_count} members  ₹{gross}", flush=True)
+                    else:
+                        print(f"ℹ️  Skipped auto-invoice for {gym_id} — no active members yet", flush=True)
+
+                    col_gyms.update_one(
+                        {"gym_id": gym_id},
+                        {"$set": {"billing_cycle_last_invoiced_for": next_invoice_at.isoformat()}},
+                    )
+
+                # ── Roll the cycle forward once cycle-end has passed ────────────
+                if now >= next_invoice_at:
+                    new_next = next_invoice_at + timedelta(days=30)
+                    col_gyms.update_one(
+                        {"gym_id": gym_id},
+                        {"$set": {"billing_cycle_next_invoice_at": new_next}},
+                    )
+                    print(f"🔄  Billing cycle rolled forward → gym={gym_id}  next cycle ends {new_next.isoformat()}", flush=True)
+
+        except Exception as e:
+            print(f"⚠️  Pro billing job error: {e}", flush=True)
+
+        time.sleep(21600)  # every 6 hours
+
+
+threading.Thread(target=_keep_alive,          daemon=True).start()
+threading.Thread(target=_run_expiry_job,      daemon=True).start()
+threading.Thread(target=_run_pro_billing_job, daemon=True).start()
+print("✅  Background threads started (keep-alive + expiry job + pro billing job)", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FASTAPI APP
@@ -1285,6 +1393,11 @@ def create_gym(req: GymCreate):
         "pro_activation_razorpay_order_id": None,
         "pro_activation_order_created_at":  None,
         "pro_fee_last_payment_ref": None,
+        # ── NEW: monthly billing cycle fields — set once, at first Pro
+        # activation payment (see pro_activation_verify_payment) ────────────
+        "billing_cycle_start":              None,
+        "billing_cycle_next_invoice_at":    None,
+        "billing_cycle_last_invoiced_for":  None,
         "created_at":        now,
     })
 
@@ -1398,8 +1511,8 @@ def delete_gym(gym_id: str):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — PRO PLAN ACTIVATION (₹5,000/year — required before a Pro gym's
-#  admin can access the dashboard; checked on every login, no bypass)
+#  ROUTES — PRO PLAN ACTIVATION (gates the ENTIRE admin dashboard until
+#  paid, checked on every login, no bypass)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/gym/{gym_id}/pro-activation-status")
@@ -1421,7 +1534,7 @@ def pro_activation_status(gym_id: str):
             "required":      False,
             "expires_at":    _fmt_dt(expires_at),
             "days_left":     days_left,
-            "expiring_soon": days_left <= 15,   # ← new
+            "expiring_soon": days_left <= 15,
         }
 
     return {
@@ -1434,7 +1547,7 @@ def pro_activation_status(gym_id: str):
 @app.post("/gym/{gym_id}/pro-activation/create-order")
 def pro_activation_create_order(gym_id: str):
     """
-    Creates a Razorpay order for the fixed ₹5,000/year fee. Reuses an
+    Creates a Razorpay order for the fixed activation fee. Reuses an
     existing unpaid order if one is still open, same pattern as invoice
     payment orders, so repeated "Pay" clicks don't spam Razorpay.
     """
@@ -1505,8 +1618,9 @@ def pro_activation_create_order(gym_id: str):
 
 @app.post("/gym/{gym_id}/pro-activation/reset-order")
 def pro_activation_reset_order(gym_id: str):
-    """TEMP: clears the cached Razorpay order so a fresh one is created
-    at the current PRO_ACTIVATION_FEE_INR. Delete this route after use."""
+    """TEMP/TESTING ONLY: clears the cached Razorpay order so a fresh one
+    is created at the current PRO_ACTIVATION_FEE_INR. Remove this route
+    before going live — it's unauthenticated."""
     result = col_gyms.update_one(
         {"gym_id": gym_id},
         {"$unset": {
@@ -1524,6 +1638,10 @@ def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
     dashboard for exactly 1 year. If the admin is renewing before expiry,
     the extra year stacks on top of the current expiry (same pattern as
     indie plan renewals) rather than resetting from "now".
+
+    NEW: also starts the gym's monthly ₹35/member billing cycle — but only
+    the FIRST time this gym ever pays the Pro activation fee. Renewals of
+    the yearly fee do NOT reset the monthly cycle's anchor date.
     """
     if not _verify_hmac(req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature):
         raise HTTPException(400, "Payment verification failed. Signature mismatch.")
@@ -1540,15 +1658,20 @@ def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
     base       = current_expiry if (current_expiry and current_expiry > now) else now
     new_expiry = base + timedelta(days=365)
 
-    col_gyms.update_one(
-        {"gym_id": gym_id},
-        {"$set": {
-            "pro_fee_paid":             True,
-            "pro_fee_paid_at":          now,
-            "pro_fee_expires_at":       new_expiry,
-            "pro_fee_last_payment_ref": req.razorpay_payment_id,
-        }},
-    )
+    update_fields = {
+        "pro_fee_paid":             True,
+        "pro_fee_paid_at":          now,
+        "pro_fee_expires_at":       new_expiry,
+        "pro_fee_last_payment_ref": req.razorpay_payment_id,
+    }
+
+    # ── NEW: start the monthly billing cycle — ONCE, on first activation ────
+    if not gym.get("billing_cycle_start"):
+        update_fields["billing_cycle_start"]           = now
+        update_fields["billing_cycle_next_invoice_at"] = now + timedelta(days=30)
+        print(f"✅  Monthly billing cycle started → gym={gym_id}  first invoice due {(now + timedelta(days=30)).isoformat()}", flush=True)
+
+    col_gyms.update_one({"gym_id": gym_id}, {"$set": update_fields})
 
     print(f"✅  Pro activation paid → gym={gym_id}  pid={req.razorpay_payment_id}  valid until {new_expiry.isoformat()}", flush=True)
     return {
@@ -1619,7 +1742,9 @@ def delete_gym_admin(admin_id: str):
 #  ROUTES — INVOICES (super admin — manual gym billing)
 # ══════════════════════════════════════════════════════════════════════════════
 
-AEROFIT_FEE_PER_USER = 40
+# NOTE: this is now also the fee used by the automatic monthly Pro billing
+# job above — kept as a single constant so both paths always agree.
+AEROFIT_FEE_PER_USER = 35
 
 @app.post("/alpha/invoices")
 def create_invoice(req: InvoiceCreate):
@@ -1801,6 +1926,8 @@ def gym_billing_summary(gym_id: str):
         "paid_count":        len(paid),
         "pending_count":     len(pending),
         "overdue_count":     len(overdue),
+        # ── NEW: next auto-billing date for this gym's monthly Pro cycle ────
+        "next_billing_date": _fmt_dt(gym.get("billing_cycle_next_invoice_at")),
     }
 
 
