@@ -1503,6 +1503,19 @@ def pro_activation_create_order(gym_id: str):
         "prefill_name":  gym.get("name", ""),
     }
 
+@app.post("/gym/{gym_id}/pro-activation/reset-order")
+def pro_activation_reset_order(gym_id: str):
+    """TEMP: clears the cached Razorpay order so a fresh one is created
+    at the current PRO_ACTIVATION_FEE_INR. Delete this route after use."""
+    result = col_gyms.update_one(
+        {"gym_id": gym_id},
+        {"$unset": {
+            "pro_activation_razorpay_order_id": "",
+            "pro_activation_order_created_at": "",
+        }},
+    )
+    return {"status": "ok", "matched": result.matched_count}
+
 
 @app.post("/gym/{gym_id}/pro-activation/verify-payment")
 def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
