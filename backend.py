@@ -1704,13 +1704,13 @@ AGREEMENT_TEXT = """GYM PARTNERSHIP & SERVICE AGREEMENT
 
 This Agreement is entered into on {agreement_date} between:
 
-AERO-VISUALS ("Company"), the owner and operator of the AERO-FIT application,
+AERO-VISUALS (The Company), the owner and operator of the AERO-FIT application,
 AND
 {gym_name} ("Gym/Admin"), represented by {admin_name}, holding identification
 proof: {id_type} (ID No: {id_number_masked}).
 
 1. PRO ACTIVATION FEE
-The Gym/Admin has paid a one-time Pro Activation Fee to activate Pro/Gym
+The Gym/Admin has paid a one-time Pro Activation Fee (₹5000) to activate Pro/Gym
 Management features on the AERO-FIT platform. This fee is strictly
 NON-REFUNDABLE under any circumstances, including account termination,
 service dissatisfaction, or discontinuation of use.
@@ -1769,7 +1769,7 @@ def _generate_agreement_pdf(gym_name: str, admin_name: str, id_type: str,
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "AERO-VISUALS - Gym Partnership Agreement", ln=True, align="C")
+    pdf.cell(0, 10, "AERO-VISUALS - Gym App Partnership Agreement", ln=True, align="C")
     pdf.ln(4)
     pdf.set_font("Helvetica", "", 10.5)
 
