@@ -136,6 +136,7 @@ col_signup_otps: Collection = mdb["indie_signup_otps"]
 col_indie_notifs: Collection = mdb["indie_notifications"]
 col_apple_pending:      Collection = mdb["indie_apple_pending_signups"]
 col_apple_transactions: Collection = mdb["indie_apple_transactions"]
+col_agreements: Collection = mdb["gym_agreements"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
@@ -172,6 +173,8 @@ col_apple_pending.create_index("email", unique=True)
 col_apple_pending.create_index("expires_at")
 col_apple_transactions.create_index("transaction_id", unique=True)
 col_apple_transactions.create_index("email")
+col_agreements.create_index("gym_id", unique=True)
+col_agreements.create_index("agreement_id", unique=True)
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -1273,6 +1276,15 @@ class AppleVerifyRequest(BaseModel):
     product_id:     str
     transaction_id: str
 
+# ── Gym Partnership Agreement (website / admin dashboard only) ──────────────
+class AgreementSubmit(BaseModel):
+    admin_name:        str
+    gym_name:          str
+    id_type:           str   # "Aadhar" | "Driving License" | "Other"
+    id_number:         str
+    signature_base64:  str
+    id_proof_base64:   str
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1678,6 +1690,214 @@ def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
         "status":     "activated",
         "gym_id":     gym_id,
         "expires_at": new_expiry.isoformat(),
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — GYM PARTNERSHIP AGREEMENT (website / admin dashboard only)
+#  Shown after Pro Activation Fee is paid, before the rest of the admin
+#  dashboard unlocks. Admin enters gym name + their name, uploads a
+#  signature and an ID proof (Aadhar / Driving Licence / Other), and a
+#  signed PDF agreement is generated and stored.
+# ══════════════════════════════════════════════════════════════════════════════
+
+AGREEMENT_TEXT = """GYM PARTNERSHIP & SERVICE AGREEMENT
+
+This Agreement is entered into on {agreement_date} between:
+
+AERO-VISUALS ("Company"), the owner and operator of the AERO-FIT application,
+AND
+{gym_name} ("Gym/Admin"), represented by {admin_name}, holding identification
+proof: {id_type} (ID No: {id_number_masked}).
+
+1. PRO ACTIVATION FEE
+The Gym/Admin has paid a one-time Pro Activation Fee to activate Pro/Gym
+Management features on the AERO-FIT platform. This fee is strictly
+NON-REFUNDABLE under any circumstances, including account termination,
+service dissatisfaction, or discontinuation of use.
+
+2. MONTHLY SUBSCRIPTION FEE
+The Gym/Admin agrees to pay a recurring monthly fee of Rs.{monthly_fee} per
+active registered user/member under the Gym's account, billed monthly based
+on active user count. Non-payment may result in suspension of Gym features
+until dues are cleared.
+
+3. SCOPE OF SERVICES
+Aero-Visuals shall provide access to the AERO-FIT Gym Management Dashboard,
+member tracking, AI-based meal scanning, workout guidance, activity
+tracking, and related features as available on the platform.
+
+4. RESPONSIBILITIES OF THE GYM/ADMIN
+a. Provide accurate gym and identification information.
+b. Ensure timely payment of monthly subscription fees.
+c. Use the platform in compliance with applicable laws.
+d. Not misuse, resell, or unauthorizedly redistribute platform access.
+
+5. TERM & TERMINATION
+This Agreement remains valid as long as the Gym/Admin account is active on
+AERO-FIT. Either party may terminate this agreement with written notice;
+however, the Pro Activation Fee remains non-refundable regardless of
+termination timing.
+
+6. DATA & PRIVACY
+Identification and signature data collected are used solely for
+verification and legal record-keeping purposes, governed by Aero-Visuals'
+Privacy Policy.
+
+7. GOVERNING LAW
+This Agreement shall be governed by the laws of India.
+
+By signing below, the Gym/Admin acknowledges having read, understood, and
+agreed to all terms stated above.
+
+Admin Name: {admin_name}
+Gym Name: {gym_name}
+Date: {agreement_date}
+ID Proof Type: {id_type}
+"""
+
+def _mask_id(id_number: str) -> str:
+    id_number = id_number.strip()
+    if len(id_number) <= 4:
+        return "*" * len(id_number)
+    return id_number[:2] + "*" * (len(id_number) - 4) + id_number[-2:]
+
+def _generate_agreement_pdf(gym_name: str, admin_name: str, id_type: str,
+                             id_number_masked: str, signature_local_path: str,
+                             agreement_date: str) -> bytes:
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "AERO-VISUALS - Gym Partnership Agreement", ln=True, align="C")
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "", 10.5)
+
+    body = AGREEMENT_TEXT.format(
+        agreement_date=agreement_date,
+        gym_name=gym_name,
+        admin_name=admin_name,
+        id_type=id_type,
+        id_number_masked=id_number_masked,
+        monthly_fee=int(AEROFIT_FEE_PER_USER),
+    )
+    pdf.multi_cell(0, 5.5, body)
+
+    if signature_local_path and os.path.exists(signature_local_path):
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 10.5)
+        pdf.cell(0, 6, "Signature:", ln=True)
+        pdf.image(signature_local_path, w=60)
+
+    out = pdf.output(dest="S")
+    return bytes(out)
+
+
+@app.get("/gym/{gym_id}/agreement-status")
+def agreement_status(gym_id: str):
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+
+    if gym.get("plan") != "Pro" or not gym.get("pro_fee_paid"):
+        # Agreement only relevant once Pro is active — activation gate handles the rest
+        return {"required": False}
+
+    agreement = col_agreements.find_one({"gym_id": gym_id})
+    return {"required": agreement is None, "signed": agreement is not None}
+
+
+@app.get("/gym/{gym_id}/agreement")
+def get_agreement(gym_id: str):
+    doc = col_agreements.find_one({"gym_id": gym_id})
+    if not doc:
+        raise HTTPException(404, "No agreement on file for this gym")
+    return _doc(doc)
+
+
+@app.post("/gym/{gym_id}/agreement/submit")
+def submit_agreement(gym_id: str, req: AgreementSubmit):
+    gym = col_gyms.find_one({"gym_id": gym_id})
+    if not gym:
+        raise HTTPException(404, "Gym not found")
+    if gym.get("plan") != "Pro" or not gym.get("pro_fee_paid"):
+        raise HTTPException(400, "Pro Activation Fee must be paid before signing the agreement")
+    if col_agreements.find_one({"gym_id": gym_id}):
+        raise HTTPException(409, "An agreement has already been submitted for this gym")
+
+    if not req.admin_name.strip() or not req.gym_name.strip() or not req.id_number.strip():
+        raise HTTPException(400, "Admin name, gym name, and ID number are required")
+    if req.id_type not in ("Aadhar", "Driving License", "Other"):
+        raise HTTPException(400, "Invalid ID type")
+
+    agreement_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    agreement_date = now.strftime("%d-%m-%Y")
+
+    # ── Upload signature + ID proof images to Cloudinary ────────────────────
+    sig_url = upload_image(req.signature_base64, folder="aerofitdb/agreements/signatures", public_id=agreement_id)
+    id_url  = upload_image(req.id_proof_base64,  folder="aerofitdb/agreements/id_proofs",  public_id=agreement_id)
+
+    if not sig_url:
+        raise HTTPException(400, "Signature image is required")
+    if not id_url:
+        raise HTTPException(400, "ID proof image is required")
+
+    id_number_masked = _mask_id(req.id_number)
+
+    # ── Build PDF — download the just-uploaded signature briefly to embed ──
+    sig_local_path = f"/tmp/sig_{agreement_id}.png"
+    pdf_bytes = None
+    try:
+        resp = http_requests.get(sig_url, timeout=10)
+        with open(sig_local_path, "wb") as f:
+            f.write(resp.content)
+        pdf_bytes = _generate_agreement_pdf(
+            gym_name=req.gym_name.strip(),
+            admin_name=req.admin_name.strip(),
+            id_type=req.id_type,
+            id_number_masked=id_number_masked,
+            signature_local_path=sig_local_path,
+            agreement_date=agreement_date,
+        )
+    finally:
+        if os.path.exists(sig_local_path):
+            os.remove(sig_local_path)
+
+    # ── Upload the generated PDF to Cloudinary as a raw asset ───────────────
+    pdf_upload = cloudinary.uploader.upload(
+        pdf_bytes,
+        resource_type="raw",
+        folder="aerofitdb/agreements/pdf",
+        public_id=agreement_id,
+        format="pdf",
+        overwrite=True,
+    )
+    pdf_url = pdf_upload.get("secure_url", "")
+
+    doc = {
+        "agreement_id":       agreement_id,
+        "gym_id":             gym_id,
+        "admin_name":         req.admin_name.strip(),
+        "gym_name":           req.gym_name.strip(),
+        "id_type":            req.id_type,
+        "id_number_masked":   id_number_masked,
+        "signature_url":      sig_url,
+        "id_proof_url":       id_url,
+        "agreement_pdf_url":  pdf_url,
+        "pro_activation_fee": PRO_ACTIVATION_FEE_INR,
+        "monthly_fee_per_user": AEROFIT_FEE_PER_USER,
+        "agreement_date":     agreement_date,
+        "status":             "signed",
+        "created_at":         now,
+    }
+    col_agreements.insert_one(doc)
+
+    print(f"✅  Agreement signed → gym={gym_id}  admin={req.admin_name}  pdf={pdf_url}", flush=True)
+    return {
+        "status":            "signed",
+        "agreement_id":      agreement_id,
+        "agreement_pdf_url": pdf_url,
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
