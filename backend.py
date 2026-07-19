@@ -940,7 +940,7 @@ print("✅  Background threads started (keep-alive + expiry job + pro billing jo
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="20.1.0")
+app = FastAPI(title="AERO-FIT API", version="20.1.1")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -1183,7 +1183,7 @@ class GymAdminResetPasswordRequest(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "20.1.0",
+        "version":        "20.1.1",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -1690,7 +1690,7 @@ AND
 proof: {id_type} (ID No: {id_number_masked}).
 
 1. PRO ACTIVATION FEE
-The Gym/Admin has paid a one-time Pro Activation Fee (₹5000) to activate Pro/Gym
+The Gym/Admin has paid a one-time Pro Activation Fee (Rs.5000) to activate Pro/Gym
 Management features on the AERO-FIT platform. This fee is strictly
 NON-REFUNDABLE under any circumstances, including account termination,
 service dissatisfaction, or discontinuation of use.
@@ -1741,6 +1741,17 @@ def _mask_id(id_number: str) -> str:
         return "*" * len(id_number)
     return id_number[:2] + "*" * (len(id_number) - 4) + id_number[-2:]
 
+def _pdf_safe(text: str) -> str:
+    """
+    fpdf2's core Helvetica font only supports Latin-1. Any character outside
+    that range (₹, emoji, curly quotes, non-Latin scripts, etc.) crashes
+    multi_cell() with a Unicode encoding error. Since gym_name and admin_name
+    are free-text user input (and could theoretically contain such
+    characters even after the ₹ literal below is fixed), sanitize before
+    handing text to fpdf so a stray character can never 500 this endpoint.
+    """
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
 def _generate_agreement_pdf(gym_name: str, admin_name: str, id_type: str,
                              id_number_masked: str, signature_local_path: str,
                              agreement_date: str) -> bytes:
@@ -1761,7 +1772,7 @@ def _generate_agreement_pdf(gym_name: str, admin_name: str, id_type: str,
         id_number_masked=id_number_masked,
         monthly_fee=int(AEROFIT_FEE_PER_USER),
     )
-    pdf.multi_cell(0, 5.5, body)
+    pdf.multi_cell(0, 5.5, _pdf_safe(body))
 
     if signature_local_path and os.path.exists(signature_local_path):
         pdf.ln(4)
