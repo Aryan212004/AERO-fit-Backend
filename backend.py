@@ -68,9 +68,9 @@ GYM_SHARE_PCT      = 60
 # Charged once at first gym-admin login, then annually thereafter. Gates the
 # ENTIRE admin dashboard (banners, notifications, User IDs, everything) until
 # paid — see /gym/{gym_id}/pro-activation-status and friends below.
-# NOTE: currently set to "5" for testing — change back to "5000" before going
-# live, and remove the /pro-activation/reset-order debug route below too.
-PRO_ACTIVATION_FEE_INR = float(os.environ.get("PRO_ACTIVATION_FEE_INR", "5"))  # ₹/year
+# Live value: ₹5000/year. Can still be overridden via the PRO_ACTIVATION_FEE_INR
+# env var if you ever need to change it without a redeploy.
+PRO_ACTIVATION_FEE_INR = float(os.environ.get("PRO_ACTIVATION_FEE_INR", "5000"))  # ₹/year
 
 INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/month — Android/Razorpay
 INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month — Android/Razorpay
@@ -1624,10 +1624,17 @@ def pro_activation_create_order(gym_id: str):
     }
 
 @app.post("/gym/{gym_id}/pro-activation/reset-order")
-def pro_activation_reset_order(gym_id: str):
-    """TEMP/TESTING ONLY: clears the cached Razorpay order so a fresh one
-    is created at the current PRO_ACTIVATION_FEE_INR. Remove this route
-    before going live — it's unauthenticated."""
+def pro_activation_reset_order(gym_id: str, req: AlphaLogin):
+    """Alpha-admin only: clears a gym's cached Razorpay pro-activation order
+    so a fresh one is created at the current PRO_ACTIVATION_FEE_INR. Useful
+    if a gym's order was created before a price change and needs to be
+    regenerated. Requires alpha-admin credentials — see /alpha/login."""
+    if req.username != ALPHA_USERNAME or req.password != ALPHA_PASSWORD:
+        raise HTTPException(401, "Invalid alpha admin credentials")
+
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+
     result = col_gyms.update_one(
         {"gym_id": gym_id},
         {"$unset": {
@@ -1635,6 +1642,7 @@ def pro_activation_reset_order(gym_id: str):
             "pro_activation_order_created_at": "",
         }},
     )
+    print(f"✅  Pro-activation order reset by alpha admin → gym={gym_id}", flush=True)
     return {"status": "ok", "matched": result.matched_count}
 
 
