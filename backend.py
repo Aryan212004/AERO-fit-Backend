@@ -76,11 +76,6 @@ INDIE_BASE_PRICE   = float(os.environ.get("INDIE_BASE_PRICE",  "159"))  # ₹/mo
 INDIE_DISCOUNT_PCT = float(os.environ.get("INDIE_DISCOUNT_PCT", "1"))   # 1% per extra month — Android/Razorpay
 
 # ── iOS / Apple In-App Purchase pricing ──────────────────────────────────────
-# Apple's App Store pricing is flat per-month with NO multi-month discount —
-# this must match exactly what's configured for each product in App Store
-# Connect (aerofit_indie_1m/3m/6m/12m), since Apple owns the actual charge.
-# This backend constant is only used to (a) display pricing before purchase
-# and (b) sanity-check receipts; it never creates a Razorpay order.
 IOS_INDIE_BASE_PRICE = float(os.environ.get("IOS_INDIE_BASE_PRICE", "199"))  # ₹/month — Apple IAP only
 
 APPLE_SHARED_SECRET     = os.environ.get("APPLE_SHARED_SECRET", "").strip()
@@ -137,6 +132,8 @@ col_indie_notifs: Collection = mdb["indie_notifications"]
 col_apple_pending:      Collection = mdb["indie_apple_pending_signups"]
 col_apple_transactions: Collection = mdb["indie_apple_transactions"]
 col_agreements: Collection = mdb["gym_agreements"]
+# ── NEW: gym-admin (website) password reset OTP/token records ───────────────
+col_gym_admin_resets: Collection = mdb["gym_admin_password_resets"]
 
 # ── Indexes ───────────────────────────────────────────────────────────────────
 col_users.create_index("email", unique=True)
@@ -175,6 +172,9 @@ col_apple_transactions.create_index("transaction_id", unique=True)
 col_apple_transactions.create_index("email")
 col_agreements.create_index("gym_id", unique=True)
 col_agreements.create_index("agreement_id", unique=True)
+# ── NEW: gym-admin reset indexes ─────────────────────────────────────────────
+col_gym_admin_resets.create_index("email")
+col_gym_admin_resets.create_index("expires_at")
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -349,12 +349,7 @@ def _indie_pricing(months: int) -> dict:
     }
 
 def _indie_pricing_ios(months: int) -> dict:
-    """
-    iOS / Apple IAP pricing — flat ₹199/month, NO multi-month discount.
-    e.g. 1mo = ₹199, 3mo = ₹597, 6mo = ₹1194, 12mo = ₹2388.
-    Must mirror what's configured for each product in App Store Connect —
-    this is used for display/estimate only; Apple owns the actual charge.
-    """
+    """iOS / Apple IAP pricing — flat ₹199/month, NO multi-month discount."""
     months    = max(1, min(months, 12))
     final_inr = round(IOS_INDIE_BASE_PRICE * months, 2)
     return {
@@ -377,13 +372,6 @@ def _verify_hmac(order_id: str, payment_id: str, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 def _verify_apple_receipt(receipt_data: str) -> dict:
-    """
-    Validates a StoreKit receipt against Apple's verifyReceipt endpoint.
-    Tries production first; if Apple returns status 21007 ("this receipt
-    is from the test environment"), retries against sandbox — Apple's
-    documented pattern, so TestFlight/dev builds and real purchases both
-    work without branching client-side.
-    """
     if not APPLE_SHARED_SECRET:
         raise HTTPException(500, "Apple receipt verification is not configured on the server")
 
@@ -407,11 +395,6 @@ def _verify_apple_receipt(receipt_data: str) -> dict:
 
 
 def _find_apple_transaction(receipt_json: dict, transaction_id: str, product_id: str) -> dict:
-    """
-    Finds the specific transaction in a verified receipt and cross-checks
-    product_id against what Apple recorded — never trust the client's
-    claimed product_id alone.
-    """
     candidates = (
         receipt_json.get("latest_receipt_info")
         or receipt_json.get("receipt", {}).get("in_app", [])
@@ -450,56 +433,27 @@ def _invoice_number() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _cascade_delete_gym(gym_id: str) -> dict:
-    """
-    Permanently deletes a gym and ALL associated data:
-      - gym record
-      - gym admin accounts
-      - all user accounts registered under this gym
-      - their meal logs
-      - their scan limit records
-      - all User ID codes for this gym
-      - all invoices for this gym
-      - all banners for this gym
-      - all notifications for this gym
-
-    Returns a summary dict of deleted counts for logging.
-    """
-    # ── 1. Collect all member emails before deleting anything ─────────────────
     member_emails = [
         u["email"] for u in col_users.find({"gym_id": gym_id}, {"email": 1})
     ]
 
-    # ── 2. Delete gym members (users) ─────────────────────────────────────────
     users_result = col_users.delete_many({"gym_id": gym_id})
 
-    # ── 3. Delete meal logs for those members ─────────────────────────────────
     meals_deleted = 0
     if member_emails:
         meals_result  = col_meals.delete_many({"email": {"$in": member_emails}})
         meals_deleted = meals_result.deleted_count
 
-    # ── 4. Delete scan limits for those members ───────────────────────────────
     scans_deleted = 0
     if member_emails:
         scans_result  = col_scan_limits.delete_many({"email": {"$in": member_emails}})
         scans_deleted = scans_result.deleted_count
 
-    # ── 5. Delete all User ID codes for this gym ──────────────────────────────
     user_ids_result = col_user_ids.delete_many({"gym_id": gym_id})
-
-    # ── 6. Delete all invoices for this gym ───────────────────────────────────
     invoices_result = col_invoices.delete_many({"gym_id": gym_id})
-
-    # ── 7. Delete all banners for this gym ────────────────────────────────────
     banners_result = col_banners.delete_many({"gym_id": gym_id})
-
-    # ── 8. Delete all notifications for this gym ──────────────────────────────
     notifs_result = col_notifs.delete_many({"gym_id": gym_id})
-
-    # ── 9. Delete gym admin accounts ──────────────────────────────────────────
     admins_result = col_gym_admins.delete_many({"gym_id": gym_id})
-
-    # ── 10. Delete the gym record itself ──────────────────────────────────────
     col_gyms.delete_one({"gym_id": gym_id})
 
     summary = {
@@ -528,14 +482,6 @@ def _cascade_delete_gym(gym_id: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _cascade_delete_indie_user(email: str) -> dict:
-    """
-    Permanently deletes an independent (non-gym) user who failed to renew
-    within the 2-day grace period after their plan expired.
-    Deletes: user record, meal logs, scan-limit records, and any indie
-    billing-alert notifications for this email.
-    Payment history is intentionally kept for accounting purposes.
-    Gym members are NEVER passed to this function.
-    """
     meals_result  = col_meals.delete_many({"email": email})
     scans_result  = col_scan_limits.delete_many({"email": email})
     notifs_result = col_indie_notifs.delete_many({"email": email})
@@ -561,10 +507,6 @@ def _cascade_delete_indie_user(email: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _send_fcm_push(gym_id: str, title: str, body: str, data: dict = {}):
-    """
-    Sends OS-level push notification to all devices subscribed
-    to topic gym_{gym_id}. Works when app is fully closed.
-    """
     try:
         if not FIREBASE_PROJECT_ID:
             print("⚠️  FIREBASE_PROJECT_ID not set — skipping push", flush=True)
@@ -631,11 +573,6 @@ def _send_fcm_push(gym_id: str, title: str, body: str, data: dict = {}):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _send_fcm_push_to_token(token: str, title: str, body: str, data: dict = {}):
-    """
-    Sends an OS-level push notification to a single device by FCM token.
-    Used for independent (non-gym) users who aren't subscribed to any
-    gym_{id} topic. Mirrors _send_fcm_push but targets `token` not `topic`.
-    """
     try:
         if not token:
             print("⚠️  _send_fcm_push_to_token: empty token — skipping", flush=True)
@@ -708,22 +645,13 @@ def _create_indie_alert(
     alert_type: str,
     deep_link: str = "aerofit://profile/billing",
 ) -> bool:
-    """
-    Creates an in-app indie notification AND fires a direct device push,
-    but only ONCE per (email, alert_key) — alert_key acts as a dedupe
-    fingerprint (e.g. "expiring_soon_2026-06-25" or "grace_period_2026-06-22")
-    so the hourly job never spams the same alert twice.
-
-    Returns True if a new alert was created, False if it already existed
-    (i.e. already sent — safe to call every hour without duplicating).
-    """
     now = datetime.now(timezone.utc)
     try:
         col_indie_notifs.insert_one({
             "notification_id": str(uuid.uuid4()),
             "email":            email,
             "alert_key":        alert_key,
-            "alert_type":       alert_type,   # "expiring_soon" | "grace_period" | "renewed"
+            "alert_type":       alert_type,
             "title":            title,
             "body":             body,
             "deep_link":        deep_link,
@@ -731,7 +659,6 @@ def _create_indie_alert(
             "sent_at":          now,
         })
     except Exception:
-        # Duplicate key on (email, alert_key) — already sent this exact alert.
         return False
 
     user  = col_users.find_one({"email": email}, {"fcm_token": 1})
@@ -753,11 +680,6 @@ def _generate_otp() -> str:
 
 
 def _send_otp_email(to_email: str, name: str, otp: str) -> bool:
-    """
-    Sends the OTP email via Resend. Returns True on success.
-    Swap this function's body if you switch email providers later —
-    nothing else in the codebase needs to change.
-    """
     try:
         resend.Emails.send({
             "from":    RESEND_FROM,
@@ -793,7 +715,6 @@ def _generate_reset_token() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _keep_alive():
-    """Pings the server every 5 min to prevent Render free-tier sleep."""
     time.sleep(120)
     while True:
         try:
@@ -806,28 +727,13 @@ def _keep_alive():
 
 
 def _run_expiry_job():
-    """
-    Hourly job — now FOUR tasks:
-      1. Expire gym memberships whose user-ID expires_at has passed.
-      2a. Raise a "renew soon" billing alert (in-app + push) for indie
-          users whose plan expires within the next 3 days.
-      2b. Move indie users whose indie_expires_at has passed into a
-          2-day grace period, AND raise a "grace period" billing alert
-          (in-app + push) the moment that happens.
-      2c. Permanently delete indie users whose grace period has lapsed.
-
-    Gym members are NEVER auto-deleted — only indie accounts, and only
-    after they fail to renew within the 2-day grace window.
-    """
     time.sleep(30)
     while True:
         try:
             now = datetime.now(timezone.utc)
 
-            # ── 0. Billing alerts older than 2 days → permanent delete ─────────
             _cleanup_old_billing_alerts(now)
 
-            # ── 1. Gym memberships ────────────────────────────────────────────
             expired_ids = list(col_user_ids.find({
                 "status":     "used",
                 "expires_at": {"$lte": now},
@@ -859,7 +765,6 @@ def _run_expiry_job():
                 )
                 print(f"   ↳ Deleted User ID: {code} — gym: {gym_id}", flush=True)
 
-            # ── 2a. Indie plans expiring within 3 days → "renew soon" alert ────
             soon_cutoff = now + timedelta(days=3)
             expiring_soon = list(col_users.find({
                 "indie_plan":         True,
@@ -882,7 +787,6 @@ def _run_expiry_job():
                     ),
                 )
 
-            # ── 2b. Indie plan expirations → enter 2-day grace period ──────────
             newly_expired_indie = list(col_users.find({
                 "indie_plan":         True,
                 "membership_expired": {"$ne": True},
@@ -915,7 +819,6 @@ def _run_expiry_job():
                     ),
                 )
 
-            # ── 1b. Trial gyms past their 14-day window → auto-delete ──────────
             expired_trials = list(col_gyms.find({
                 "status":            "trial",
                 "trial_expires_at":  {"$lte": now},
@@ -929,8 +832,6 @@ def _run_expiry_job():
                 print(f"   ↳ Auto-deleting expired trial gym: {gym.get('name')} ({gid})", flush=True)
                 _cascade_delete_gym(gid)
 
-            # ── 2c. Indie users past grace period → permanent deletion ─────────
-            # Gym members are NEVER auto-deleted — only indie accounts.
             to_delete = list(col_users.find({
                 "indie_plan":           True,
                 "membership_expired":   True,
@@ -949,29 +850,7 @@ def _run_expiry_job():
         time.sleep(3600)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  NEW: MONTHLY PRO BILLING JOB
-#  Charges every Pro gym ₹35/member/month, on a rolling monthly cycle
-#  anchored to the date the gym FIRST paid its Pro activation fee.
-#  2 days before each cycle's end date, this auto-generates an invoice and
-#  pushes a billing notification to the gym admin — no super-admin action
-#  needed. Only ever touches Pro gyms; Trial gyms are completely untouched.
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _run_pro_billing_job():
-    """
-    Runs every 6 hours. For each Pro-plan gym with an active monthly
-    billing cycle (billing_cycle_next_invoice_at set — this is stamped the
-    moment the gym FIRST pays its Pro activation fee, see
-    pro_activation_verify_payment):
-
-      1. If we're within 2 days of that gym's cycle-end date and haven't
-         already auto-invoiced for this specific cycle, generate a
-         ₹35/member invoice (due on the cycle-end date) and fire a billing
-         notification to the gym admin.
-      2. Once the cycle-end date itself has passed, roll the cycle forward
-         by another 30 days so this repeats indefinitely, every month.
-    """
     time.sleep(60)
     while True:
         try:
@@ -991,7 +870,6 @@ def _run_pro_billing_job():
                 reminder_at = next_invoice_at - timedelta(days=2)
                 already_invoiced = gym.get("billing_cycle_last_invoiced_for") == next_invoice_at.isoformat()
 
-                # ── Auto-generate invoice 2 days before this cycle's end ────────
                 if now >= reminder_at and not already_invoiced:
                     member_count = col_user_ids.count_documents({"gym_id": gym_id, "status": "used"})
                     if member_count > 0:
@@ -1039,7 +917,6 @@ def _run_pro_billing_job():
                         {"$set": {"billing_cycle_last_invoiced_for": next_invoice_at.isoformat()}},
                     )
 
-                # ── Roll the cycle forward once cycle-end has passed ────────────
                 if now >= next_invoice_at:
                     new_next = next_invoice_at + timedelta(days=30)
                     col_gyms.update_one(
@@ -1063,7 +940,7 @@ print("✅  Background threads started (keep-alive + expiry job + pro billing jo
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="20.0.0")
+app = FastAPI(title="AERO-FIT API", version="20.1.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -1285,6 +1162,19 @@ class AgreementSubmit(BaseModel):
     signature_base64:  str
     id_proof_base64:   str
 
+# ── NEW: Gym admin (website) password reset models ──────────────────────────
+class GymAdminForgotPasswordRequest(BaseModel):
+    email: str
+
+class GymAdminVerifyOtpRequest(BaseModel):
+    email: str
+    otp:   str
+
+class GymAdminResetPasswordRequest(BaseModel):
+    email:        str
+    reset_token:  str
+    new_password: str
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1293,7 +1183,7 @@ class AgreementSubmit(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "20.0.0",
+        "version":        "20.1.0",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -1333,6 +1223,129 @@ def gym_admin_login(req: AdminLogin):
         "name":     adm["name"],
         "email":    adm["email"],
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — GYM ADMIN PASSWORD RESET (website — separate from app /auth/*)
+#  Uses its own gym_admin_password_resets collection so a gym admin and an
+#  app user sharing the same email never collide on reset tokens.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/gym-admin/forgot-password")
+def gym_admin_forgot_password(req: GymAdminForgotPasswordRequest):
+    email = req.email.strip().lower()
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
+        raise HTTPException(400, "Invalid email address")
+
+    admin = col_gym_admins.find_one({"email": email})
+    generic_response = {
+        "status":  "ok",
+        "message": "If an admin account exists for this email, an OTP has been sent.",
+    }
+    if not admin:
+        print(f"ℹ️  Gym-admin forgot-password requested for non-existent email: {email}", flush=True)
+        return generic_response
+
+    if admin.get("status") == "inactive":
+        # Don't leak account status either — behave identically either way.
+        print(f"ℹ️  Gym-admin forgot-password requested for inactive admin: {email}", flush=True)
+        return generic_response
+
+    now = datetime.now(timezone.utc)
+    otp = _generate_otp()
+
+    col_gym_admin_resets.delete_many({"email": email, "used": False})
+    col_gym_admin_resets.insert_one({
+        "email":       email,
+        "otp":         otp,
+        "attempts":    0,
+        "used":        False,
+        "reset_token": None,
+        "created_at":  now,
+        "expires_at":  now + timedelta(minutes=OTP_EXPIRY_MINUTES),
+    })
+
+    sent = _send_otp_email(email, admin.get("name", ""), otp)
+    if not sent:
+        print(f"⚠️  Gym-admin OTP generated but email send failed for {email}", flush=True)
+
+    print(f"✅  Gym-admin OTP issued → {email}", flush=True)
+    return generic_response
+
+
+@app.post("/gym-admin/verify-otp")
+def gym_admin_verify_otp(req: GymAdminVerifyOtpRequest):
+    email = req.email.strip().lower()
+    otp   = req.otp.strip()
+
+    record = col_gym_admin_resets.find_one({"email": email, "used": False})
+    if not record:
+        raise HTTPException(400, "No pending reset request for this email. Please request a new OTP.")
+
+    now = datetime.now(timezone.utc)
+    if _ensure_utc(record["expires_at"]) <= now:
+        col_gym_admin_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(400, "OTP has expired. Please request a new one.")
+
+    if record.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        col_gym_admin_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(429, "Too many incorrect attempts. Please request a new OTP.")
+
+    if record["otp"] != otp:
+        col_gym_admin_resets.update_one(
+            {"_id": record["_id"]},
+            {"$inc": {"attempts": 1}},
+        )
+        remaining = OTP_MAX_ATTEMPTS - (record.get("attempts", 0) + 1)
+        raise HTTPException(400, f"Incorrect OTP. {max(0, remaining)} attempt(s) remaining.")
+
+    reset_token = _generate_reset_token()
+    col_gym_admin_resets.update_one(
+        {"_id": record["_id"]},
+        {"$set": {
+            "reset_token":         reset_token,
+            "reset_token_expires": now + timedelta(minutes=RESET_TOKEN_EXPIRY_MINUTES),
+        }},
+    )
+
+    print(f"✅  Gym-admin OTP verified → {email}", flush=True)
+    return {"status": "ok", "reset_token": reset_token}
+
+
+@app.post("/gym-admin/reset-password")
+def gym_admin_reset_password(req: GymAdminResetPasswordRequest):
+    email = req.email.strip().lower()
+
+    if len(req.new_password.strip()) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    record = col_gym_admin_resets.find_one({
+        "email":       email,
+        "used":        False,
+        "reset_token": req.reset_token,
+    })
+    if not record:
+        raise HTTPException(400, "Invalid or expired reset session. Please start over.")
+
+    now = datetime.now(timezone.utc)
+    token_expiry = record.get("reset_token_expires")
+    if not token_expiry or _ensure_utc(token_expiry) <= now:
+        col_gym_admin_resets.delete_one({"_id": record["_id"]})
+        raise HTTPException(400, "Reset session expired. Please start over.")
+
+    admin = col_gym_admins.find_one({"email": email})
+    if not admin:
+        raise HTTPException(404, "Admin not found")
+
+    hashed = bcrypt.hashpw(req.new_password.strip().encode(), bcrypt.gensalt()).decode()
+    col_gym_admins.update_one({"email": email}, {"$set": {"password": hashed}})
+
+    col_gym_admin_resets.update_one(
+        {"_id": record["_id"]},
+        {"$set": {"used": True, "used_at": now}},
+    )
+
+    print(f"✅  Gym-admin password reset completed → {email}", flush=True)
+    return {"status": "ok", "message": "Password reset successful. Please sign in."}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — PLATFORM STATS
@@ -1405,8 +1418,6 @@ def create_gym(req: GymCreate):
         "pro_activation_razorpay_order_id": None,
         "pro_activation_order_created_at":  None,
         "pro_fee_last_payment_ref": None,
-        # ── NEW: monthly billing cycle fields — set once, at first Pro
-        # activation payment (see pro_activation_verify_payment) ────────────
         "billing_cycle_start":              None,
         "billing_cycle_next_invoice_at":    None,
         "billing_cycle_last_invoiced_for":  None,
@@ -1469,10 +1480,6 @@ def update_gym(gym_id: str, req: GymUpdate):
 
 @app.get("/alpha/gyms/{gym_id}/delete-preview")
 def gym_delete_preview(gym_id: str):
-    """
-    Returns counts of all data that will be deleted with this gym.
-    Frontend calls this before showing the confirmation dialog.
-    """
     gym = col_gyms.find_one({"gym_id": gym_id})
     if not gym:
         raise HTTPException(404, "Gym not found")
@@ -1484,7 +1491,6 @@ def gym_delete_preview(gym_id: str):
     notif_count    = col_notifs.count_documents({"gym_id": gym_id})
     admin_count    = col_gym_admins.count_documents({"gym_id": gym_id})
 
-    # Estimate meal records
     member_emails  = [u["email"] for u in col_users.find({"gym_id": gym_id}, {"email": 1})]
     meal_count     = col_meals.count_documents({"email": {"$in": member_emails}}) if member_emails else 0
 
@@ -1506,11 +1512,6 @@ def gym_delete_preview(gym_id: str):
 
 @app.delete("/alpha/gyms/{gym_id}")
 def delete_gym(gym_id: str):
-    """
-    Permanently deletes the gym and ALL associated data:
-    users, meals, scan limits, user IDs, invoices, banners,
-    notifications, and gym admin accounts.
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
 
@@ -1523,8 +1524,7 @@ def delete_gym(gym_id: str):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — PRO PLAN ACTIVATION (gates the ENTIRE admin dashboard until
-#  paid, checked on every login, no bypass)
+#  ROUTES — PRO PLAN ACTIVATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/gym/{gym_id}/pro-activation-status")
@@ -1558,11 +1558,6 @@ def pro_activation_status(gym_id: str):
 
 @app.post("/gym/{gym_id}/pro-activation/create-order")
 def pro_activation_create_order(gym_id: str):
-    """
-    Creates a Razorpay order for the fixed activation fee. Reuses an
-    existing unpaid order if one is still open, same pattern as invoice
-    payment orders, so repeated "Pay" clicks don't spam Razorpay.
-    """
     gym = col_gyms.find_one({"gym_id": gym_id})
     if not gym:
         raise HTTPException(404, "Gym not found")
@@ -1592,7 +1587,7 @@ def pro_activation_create_order(gym_id: str):
                     "prefill_name":  gym.get("name", ""),
                 }
         except Exception:
-            pass  # fall through and create a fresh order below
+            pass
 
     amount_paise = int(round(PRO_ACTIVATION_FEE_INR * 100))
 
@@ -1645,16 +1640,6 @@ def pro_activation_reset_order(gym_id: str):
 
 @app.post("/gym/{gym_id}/pro-activation/verify-payment")
 def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
-    """
-    Verifies the Razorpay payment signature server-side, then unlocks the
-    dashboard for exactly 1 year. If the admin is renewing before expiry,
-    the extra year stacks on top of the current expiry (same pattern as
-    indie plan renewals) rather than resetting from "now".
-
-    NEW: also starts the gym's monthly ₹35/member billing cycle — but only
-    the FIRST time this gym ever pays the Pro activation fee. Renewals of
-    the yearly fee do NOT reset the monthly cycle's anchor date.
-    """
     if not _verify_hmac(req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature):
         raise HTTPException(400, "Payment verification failed. Signature mismatch.")
 
@@ -1677,7 +1662,6 @@ def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
         "pro_fee_last_payment_ref": req.razorpay_payment_id,
     }
 
-    # ── NEW: start the monthly billing cycle — ONCE, on first activation ────
     if not gym.get("billing_cycle_start"):
         update_fields["billing_cycle_start"]           = now
         update_fields["billing_cycle_next_invoice_at"] = now + timedelta(days=30)
@@ -1693,11 +1677,7 @@ def pro_activation_verify_payment(gym_id: str, req: ProActivationVerify):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — GYM PARTNERSHIP AGREEMENT (website / admin dashboard only)
-#  Shown after Pro Activation Fee is paid, before the rest of the admin
-#  dashboard unlocks. Admin enters gym name + their name, uploads a
-#  signature and an ID proof (Aadhar / Driving Licence / Other), and a
-#  signed PDF agreement is generated and stored.
+#  ROUTES — GYM PARTNERSHIP AGREEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
 AGREEMENT_TEXT = """GYM PARTNERSHIP & SERVICE AGREEMENT
@@ -1800,7 +1780,6 @@ def agreement_status(gym_id: str):
         raise HTTPException(404, "Gym not found")
 
     if gym.get("plan") != "Pro" or not gym.get("pro_fee_paid"):
-        # Agreement only relevant once Pro is active — activation gate handles the rest
         return {"required": False}
 
     agreement = col_agreements.find_one({"gym_id": gym_id})
@@ -1834,7 +1813,6 @@ def submit_agreement(gym_id: str, req: AgreementSubmit):
     now = datetime.now(timezone.utc)
     agreement_date = now.strftime("%d-%m-%Y")
 
-    # ── Upload signature + ID proof images to Cloudinary ────────────────────
     sig_url = upload_image(req.signature_base64, folder="aerofitdb/agreements/signatures", public_id=agreement_id)
     id_url  = upload_image(req.id_proof_base64,  folder="aerofitdb/agreements/id_proofs",  public_id=agreement_id)
 
@@ -1845,7 +1823,6 @@ def submit_agreement(gym_id: str, req: AgreementSubmit):
 
     id_number_masked = _mask_id(req.id_number)
 
-    # ── Build PDF — download the just-uploaded signature briefly to embed ──
     sig_local_path = f"/tmp/sig_{agreement_id}.png"
     pdf_bytes = None
     try:
@@ -1864,7 +1841,6 @@ def submit_agreement(gym_id: str, req: AgreementSubmit):
         if os.path.exists(sig_local_path):
             os.remove(sig_local_path)
 
-    # ── Upload the generated PDF to Cloudinary as a raw asset ───────────────
     pdf_upload = cloudinary.uploader.upload(
         pdf_bytes,
         resource_type="raw",
@@ -1962,8 +1938,6 @@ def delete_gym_admin(admin_id: str):
 #  ROUTES — INVOICES (super admin — manual gym billing)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# NOTE: this is now also the fee used by the automatic monthly Pro billing
-# job above — kept as a single constant so both paths always agree.
 AEROFIT_FEE_PER_USER = 35
 
 @app.post("/alpha/invoices")
@@ -2095,13 +2069,6 @@ def _alert_title(alert_type: str, inv_number: str) -> str:
     return MAP.get(alert_type, f"📋 Invoice Alert — {inv_number}")
 
 def _cleanup_old_billing_alerts(now: datetime) -> int:
-    """
-    Deletes billing-alert notifications (the ones super admin sends to gym
-    admins via /alpha/invoices/{id}/alert) once they're older than 2 days.
-    These are stored in col_notifs with type == "billing". Gym members
-    never see these (they're filtered out by the /member endpoint), so
-    this only affects what shows in the gym admin's Billing tab.
-    """
     cutoff = now - timedelta(days=2)
     result = col_notifs.delete_many({
         "type":    "billing",
@@ -2158,11 +2125,6 @@ def gym_billing_summary(gym_id: str):
 
 @app.get("/gym/{gym_id}/notifications/unread-billing-count")
 def gym_unread_billing_count(gym_id: str):
-    """
-    Lightweight count for the sidebar Billing badge's "unread alerts" half.
-    Docs created before the `read` field existed are treated as unread
-    (missing read == not yet seen), so nothing old silently disappears.
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
     count = col_notifs.count_documents({
@@ -2175,12 +2137,6 @@ def gym_unread_billing_count(gym_id: str):
 
 @app.post("/gym/{gym_id}/notifications/mark-billing-read")
 def mark_billing_notifications_read(gym_id: str):
-    """
-    Called once when the gym admin opens the Billing tab — marks every
-    billing notification for this gym as read so the "unread alerts" half
-    of the sidebar badge clears. The "pending invoices" half of the badge
-    is untouched here; that only drops when an invoice is actually paid.
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
     result = col_notifs.update_many(
@@ -2195,12 +2151,6 @@ def mark_billing_notifications_read(gym_id: str):
 
 @app.post("/gym/{gym_id}/invoices/{invoice_id}/create-payment-order")
 def create_invoice_payment_order(gym_id: str, invoice_id: str):
-    """
-    Gym admin clicks "Pay Now" on a pending invoice → this creates a
-    Razorpay order for the EXACT invoice.gross amount (never trusts a
-    client-supplied amount) and returns checkout details for the
-    Razorpay widget on the frontend.
-    """
     gym = col_gyms.find_one({"gym_id": gym_id})
     if not gym:
         raise HTTPException(404, "Gym not found")
@@ -2214,9 +2164,6 @@ def create_invoice_payment_order(gym_id: str, invoice_id: str):
     if inv.get("status") == "cancelled":
         raise HTTPException(400, "This invoice has been cancelled")
 
-    # Reuse an existing pending Razorpay order for this invoice if one was
-    # already created (e.g. admin opened checkout, closed it, clicked again) —
-    # avoids creating duplicate orders on the Razorpay side.
     existing_order_id = inv.get("razorpay_order_id")
     if existing_order_id:
         try:
@@ -2234,7 +2181,7 @@ def create_invoice_payment_order(gym_id: str, invoice_id: str):
                     "invoice_number": inv["invoice_number"],
                 }
         except Exception:
-            pass  # fall through and create a fresh order below
+            pass
 
     amount_paise = int(round(inv["gross"] * 100))
     now = datetime.now(timezone.utc)
@@ -2276,13 +2223,6 @@ def create_invoice_payment_order(gym_id: str, invoice_id: str):
 
 @app.post("/gym/{gym_id}/invoices/{invoice_id}/verify-payment")
 def verify_invoice_payment(gym_id: str, invoice_id: str, req: InvoicePaymentVerify):
-    """
-    Verifies the Razorpay payment signature server-side (never trusts the
-    frontend's word that payment succeeded), then marks the invoice paid,
-    credits gym revenue, and raises a receipt notification — mirroring
-    exactly what /alpha/invoices/{id}/status does when super admin marks
-    an invoice paid manually, so both paths stay consistent.
-    """
     if not _verify_hmac(req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature):
         raise HTTPException(400, "Payment verification failed. Signature mismatch.")
 
@@ -2291,7 +2231,6 @@ def verify_invoice_payment(gym_id: str, invoice_id: str, req: InvoicePaymentVeri
         raise HTTPException(404, "Invoice not found for this gym")
 
     if inv.get("status") == "paid":
-        # Already processed (e.g. duplicate webhook/retry) — idempotent success.
         return {"status": "already_paid", "invoice_id": invoice_id}
 
     if inv.get("razorpay_order_id") != req.razorpay_order_id:
@@ -2511,20 +2450,14 @@ def remove_user(email: str):
 
 @app.get("/alpha/members")
 def list_all_members():
-    """
-    Returns every user in the platform — gym members and indie users —
-    with membership type, gym name, expiry, and BMI enriched inline.
-    """
     docs = list(col_users.find().sort("created_at", DESCENDING))
 
-    # Build a gym_id → gym_name lookup in one shot
     gym_ids   = {d.get("gym_id") for d in docs if d.get("gym_id")}
     gym_names = {}
     if gym_ids:
         for g in col_gyms.find({"gym_id": {"$in": list(gym_ids)}}, {"gym_id": 1, "name": 1}):
             gym_names[g["gym_id"]] = g.get("name", "")
 
-    # Build email → expires_at lookup for gym members from col_user_ids
     emails_with_gym = [d["email"] for d in docs if d.get("gym_id")]
     uid_expiry: dict[str, str] = {}
     if emails_with_gym:
@@ -2545,14 +2478,8 @@ def list_all_members():
         gym_id     = d.get("gym_id")
         gym_name   = gym_names.get(gym_id, "") if gym_id else ""
 
-        # ── member_type is derived from gym_id, NOT the indie_plan flag ──────
-        # gym_id presence is the ground truth: a user with no gym is indie,
-        # regardless of whether indie_plan was ever correctly set on legacy
-        # records (e.g. older /admin/add-user signups before the Razorpay
-        # indie flow existed).
         is_indie   = not gym_id
 
-        # Determine expiry
         if is_indie and d.get("indie_expires_at"):
             expires_at = _fmt_dt(d["indie_expires_at"])
         elif gym_id:
@@ -2602,8 +2529,6 @@ def user_login(req: UserLogin):
             grace_ends = _ensure_utc(user.get("grace_period_ends_at"))
             if not (grace_ends and grace_ends > now):
                 raise HTTPException(403, "membership_expired")
-            # else: still inside the 2-day grace period — let them log in
-            # so they can reach the Billing card and renew.
         else:
             raise HTTPException(403, "membership_expired")
 
@@ -2619,7 +2544,6 @@ def user_login(req: UserLogin):
                 }}
             )
             expired_flag = True
-            # don't raise — grace period just started, allow this login through
 
     gym_name = ""
     if user.get("gym_id"):
@@ -2747,22 +2671,17 @@ def membership_status(email: str):
         if is_indie:
             grace_ends = _ensure_utc(user.get("grace_period_ends_at"))
             if grace_ends and grace_ends > now:
-                # Still inside the 2-day grace window — keep the app usable
-                # so the user can reach the Billing card and renew.
                 return {
                     "valid":                 True,
                     "reason":                "grace_period",
                     "expired_at":            _fmt_dt(user.get("membership_expired_at")),
                     "grace_period_ends_at":  _fmt_dt(grace_ends),
                 }
-            # Grace period over — should already be deleted by the
-            # background job; this is just a fail-safe.
             return {
                 "valid":      False,
                 "reason":     "expired",
                 "expired_at": _fmt_dt(user.get("membership_expired_at")),
             }
-        # Gym members — unchanged original behaviour.
         return {
             "valid":      False,
             "reason":     "expired",
@@ -2815,12 +2734,6 @@ def membership_status(email: str):
 
 @app.post("/user/{email}/delete-account")
 def delete_own_account(email: str, req: DeleteAccountRequest):
-    """
-    Self-service account deletion (Apple Guideline 5.1.1(v)). Requires the
-    user's current password so a stolen session token alone can't wipe an
-    account. Gym members have their User ID slot released back to the gym
-    instead of deleting the gym's data; indie users are fully removed.
-    """
     email = email.strip().lower()
     user = col_users.find_one({"email": email})
     if not user:
@@ -2850,10 +2763,6 @@ def delete_own_account(email: str, req: DeleteAccountRequest):
 
 @app.get("/indie/billing-status/{email}")
 def indie_billing_status(email: str):
-    """
-    Lightweight billing summary for the Profile → Billing card.
-    Returns is_indie:false for gym members (frontend hides the card).
-    """
     email = email.strip().lower()
     user  = col_users.find_one({"email": email})
     if not user:
@@ -2883,12 +2792,6 @@ def indie_billing_status(email: str):
 
 @app.get("/indie/notifications/{email}")
 def get_indie_notifications(email: str):
-    """
-    Returns the indie billing-alert feed for one user, newest first.
-    Frontend calls this on Profile screen open (and/or polls it) to render
-    in-app banners and an unread badge. Always scoped by email — indie
-    users have no gym_id to key off of, unlike the gym notification feed.
-    """
     email = email.strip().lower()
     docs = list(
         col_indie_notifs.find({"email": email})
@@ -2900,7 +2803,6 @@ def get_indie_notifications(email: str):
 
 @app.get("/indie/notifications/{email}/unread-count")
 def get_indie_unread_count(email: str):
-    """Lightweight count for a notification-bell badge."""
     email = email.strip().lower()
     count = col_indie_notifs.count_documents({"email": email, "read": False})
     return {"unread": count}
@@ -2919,7 +2821,6 @@ def mark_indie_notification_read(notification_id: str):
 
 @app.post("/indie/notifications/{email}/read-all")
 def mark_all_indie_notifications_read(email: str):
-    """Convenience bulk endpoint — call when the user opens the alert feed."""
     email = email.strip().lower()
     result = col_indie_notifs.update_many(
         {"email": email, "read": False},
@@ -3004,7 +2905,6 @@ def create_notification(gym_id: str, req: NotificationCreate):
         "sent_at":         datetime.now(timezone.utc),
     })
 
-    # ── Fire FCM push in background — API responds instantly ─────────────────
     threading.Thread(
         target=_send_fcm_push,
         args=(gym_id, req.title, req.body),
@@ -3027,11 +2927,6 @@ def list_notifications(gym_id: str):
 
 @app.get("/gym/{gym_id}/notifications/member")
 def list_member_notifications(gym_id: str):
-    """
-    Member-facing feed — excludes notifications tagged for admin-only
-    segments (e.g. billing alerts), so members never see invoice/payment
-    reminders meant for the gym owner.
-    """
     if not col_gyms.find_one({"gym_id": gym_id}):
         raise HTTPException(404, "Gym not found")
     docs = list(
@@ -3205,7 +3100,6 @@ def delete_meal(meal_id: str):
 
 @app.get("/indie/pricing/{months}")
 def indie_pricing(months: int):
-    """Android pricing — ₹159/month base, with multi-month discount."""
     if months < 1 or months > 12:
         raise HTTPException(400, "months must be 1–12")
     return _indie_pricing(months)
@@ -3263,7 +3157,6 @@ def indie_verify_signup_otp(req: IndieVerifySignupOtpRequest):
         remaining = OTP_MAX_ATTEMPTS - (record.get("attempts", 0) + 1)
         raise HTTPException(400, f"Incorrect OTP. {max(0, remaining)} attempt(s) remaining.")
 
-    # Mark verified — create-order will check this flag before allowing payment
     col_signup_otps.update_one({"_id": record["_id"]}, {"$set": {"verified": True, "used": True}})
     print(f"✅  Signup OTP verified → {email}", flush=True)
     return {"status": "ok"}
@@ -3277,7 +3170,6 @@ def indie_create_order(req: IndieOrderRequest):
     if col_users.find_one({"email": email}):
         raise HTTPException(409, "An account with this email already exists")
 
-    # ── Require a verified OTP before allowing payment ──────────────────────
     otp_record = col_signup_otps.find_one({
         "email":    email,
         "verified": True,
@@ -3285,7 +3177,6 @@ def indie_create_order(req: IndieOrderRequest):
     })
     if not otp_record:
         raise HTTPException(400, "Please verify your email with the OTP before proceeding to payment.")
-    # ─────────────────────────────────────────────────────────────────────
 
     existing_pending = col_payments.find_one({"email": email, "status": "pending"})
     if existing_pending:
@@ -3564,14 +3455,10 @@ def indie_payment_status(order_id: str):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — INDIE PLAN — iOS / APPLE IN-APP PURCHASE (independent users)
-#  Pricing: flat ₹199/month, NO multi-month discount (matches App Store
-#  Connect product prices for aerofit_indie_1m/3m/6m/12m). Android keeps
-#  its separate ₹159/month + discount pricing via /indie/pricing/{months}.
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/indie/apple/pricing/{months}")
 def indie_pricing_ios(months: int):
-    """iOS display pricing — ₹199/month flat, e.g. 3mo = ₹597, 12mo = ₹2388."""
     if months < 1 or months > 12:
         raise HTTPException(400, "months must be 1–12")
     return _indie_pricing_ios(months)
@@ -3579,11 +3466,6 @@ def indie_pricing_ios(months: int):
 
 @app.post("/indie/apple/prepare-signup")
 def apple_prepare_signup(req: ApplePrepareSignupRequest):
-    """
-    Step 1 of iOS signup: stash the account form data before the StoreKit
-    purchase sheet opens. Apple's receipt only proves what was bought, not
-    who's signing up, so we park name/password/weight/height here first.
-    """
     email = req.email.strip().lower()
     if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
         raise HTTPException(400, "Invalid email address")
@@ -3612,13 +3494,6 @@ def apple_prepare_signup(req: ApplePrepareSignupRequest):
 
 @app.post("/indie/apple/verify-signup")
 def apple_verify_signup(req: AppleVerifyRequest):
-    """
-    Step 2: called once StoreKit reports 'purchased'/'restored'. Verifies
-    the receipt with Apple, dedupes on transaction_id, then creates the
-    account from the data stashed in prepare-signup. Plan months are
-    derived from the verified product_id — never trusted from the client
-    beyond what Apple's receipt confirms.
-    """
     email = req.email.strip().lower()
 
     pending = col_apple_pending.find_one({"email": email})
@@ -3691,10 +3566,6 @@ def apple_verify_signup(req: AppleVerifyRequest):
 
 @app.post("/indie/apple/verify-renewal")
 def apple_verify_renewal(req: AppleVerifyRequest):
-    """
-    Verifies the receipt, dedupes on transaction_id, extends
-    indie_expires_at — same stacking logic as the Razorpay renewal path.
-    """
     email = req.email.strip().lower()
     user = col_users.find_one({"email": email})
     if not user:
@@ -3771,7 +3642,7 @@ def apple_payment_status(transaction_id: str):
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ROUTES — PASSWORD RESET
+#  ROUTES — PASSWORD RESET (app users — /auth/*)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/auth/forgot-password")
@@ -3781,8 +3652,6 @@ def forgot_password(req: ForgotPasswordRequest):
         raise HTTPException(400, "Invalid email address")
 
     user = col_users.find_one({"email": email})
-    # Deliberately vague response either way, so attackers can't use this
-    # endpoint to discover which emails are registered.
     generic_response = {
         "status":  "ok",
         "message": "If an account exists for this email, an OTP has been sent.",
@@ -3795,7 +3664,6 @@ def forgot_password(req: ForgotPasswordRequest):
     now = datetime.now(timezone.utc)
     otp = _generate_otp()
 
-    # Replace any previous unused OTP for this email with a fresh one.
     col_password_resets.delete_many({"email": email, "used": False})
     col_password_resets.insert_one({
         "email":       email,
@@ -3809,7 +3677,6 @@ def forgot_password(req: ForgotPasswordRequest):
 
     sent = _send_otp_email(email, user.get("name", ""), otp)
     if not sent:
-        # Don't leak delivery failures to the client — log server-side only.
         print(f"⚠️  OTP generated but email send failed for {email}", flush=True)
 
     print(f"✅  OTP issued → {email}", flush=True)
@@ -3842,8 +3709,6 @@ def verify_otp(req: VerifyOtpRequest):
         remaining = OTP_MAX_ATTEMPTS - (record.get("attempts", 0) + 1)
         raise HTTPException(400, f"Incorrect OTP. {max(0, remaining)} attempt(s) remaining.")
 
-    # OTP correct — issue a short-lived reset token so the client doesn't
-    # need to keep resubmitting the OTP on the next screen.
     reset_token = _generate_reset_token()
     col_password_resets.update_one(
         {"_id": record["_id"]},
@@ -3885,7 +3750,6 @@ def reset_password(req: ResetPasswordRequest):
     hashed = bcrypt.hashpw(req.new_password.strip().encode(), bcrypt.gensalt()).decode()
     col_users.update_one({"email": email}, {"$set": {"password": hashed}})
 
-    # Mark this reset record used (don't delete immediately — keeps an audit trail)
     col_password_resets.update_one(
         {"_id": record["_id"]},
         {"$set": {"used": True, "used_at": now}},
