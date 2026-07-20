@@ -940,7 +940,7 @@ print("✅  Background threads started (keep-alive + expiry job + pro billing jo
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="20.1.1")
+app = FastAPI(title="AERO-FIT API", version="20.1.2")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -1175,6 +1175,10 @@ class GymAdminResetPasswordRequest(BaseModel):
     reset_token:  str
     new_password: str
 
+# ── NEW: Workout Access lock (gym admin toggles per-member Plans visibility) ─
+class WorkoutLockUpdate(BaseModel):
+    locked: bool
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1183,7 +1187,7 @@ class GymAdminResetPasswordRequest(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "20.1.1",
+        "version":        "20.1.2",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -1622,6 +1626,50 @@ def pro_activation_create_order(gym_id: str):
         "prefill_email": (admin or {}).get("email", gym.get("admin_email", "")),
         "prefill_name":  gym.get("name", ""),
     }
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — WORKOUT ACCESS (gym admin locks/unlocks the Workout Plans screen
+#  for individual members; Batches and Trainers are never affected)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/gym/{gym_id}/members")
+def list_members(gym_id: str):
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    docs = list(col_users.find({"gym_id": gym_id}).sort("created_at", DESCENDING))
+    return [
+        {
+            "email": d["email"],
+            "name": d.get("name", ""),
+            "workout_plans_locked": d.get("workout_plans_locked", False),
+        }
+        for d in docs
+    ]
+
+@app.patch("/gym/{gym_id}/members/{email}/workout-lock")
+def set_workout_lock(gym_id: str, email: str, req: WorkoutLockUpdate):
+    email = email.strip().lower()
+    member = col_users.find_one({"email": email, "gym_id": gym_id})
+    if not member:
+        raise HTTPException(404, "Member not found for this gym")
+
+    col_users.update_one(
+        {"email": email},
+        {"$set": {
+            "workout_plans_locked": req.locked,
+            "updated_at":           datetime.now(timezone.utc),
+        }},
+    )
+    print(f"✅  Workout Plans {'locked' if req.locked else 'unlocked'} → {email}  gym={gym_id}", flush=True)
+    return {"email": email, "workout_plans_locked": req.locked}
+
+# Lightweight — this is the one the Flutter app polls
+@app.get("/user/{email}/workout-access")
+def get_workout_access(email: str):
+    user = col_users.find_one({"email": email.strip().lower()})
+    if not user:
+        raise HTTPException(404, "User not found")
+    return {"locked": bool(user.get("workout_plans_locked", False))}
 
 @app.post("/gym/{gym_id}/pro-activation/reset-order")
 def pro_activation_reset_order(gym_id: str, req: AlphaLogin):
