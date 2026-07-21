@@ -175,6 +175,9 @@ col_agreements.create_index("agreement_id", unique=True)
 # ── NEW: gym-admin reset indexes ─────────────────────────────────────────────
 col_gym_admin_resets.create_index("email")
 col_gym_admin_resets.create_index("expires_at")
+col_batches: Collection = mdb["gym_batches"]
+col_batches.create_index([("gym_id", 1), ("created_at", DESCENDING)])
+col_batches.create_index("batch_id", unique=True)
 
 print(f"✅  MongoDB connected → {_db_name}", flush=True)
 
@@ -454,6 +457,7 @@ def _cascade_delete_gym(gym_id: str) -> dict:
     banners_result = col_banners.delete_many({"gym_id": gym_id})
     notifs_result = col_notifs.delete_many({"gym_id": gym_id})
     admins_result = col_gym_admins.delete_many({"gym_id": gym_id})
+    batches_result = col_batches.delete_many({"gym_id": gym_id})
     col_gyms.delete_one({"gym_id": gym_id})
 
     summary = {
@@ -466,6 +470,7 @@ def _cascade_delete_gym(gym_id: str) -> dict:
         "banners_deleted":  banners_result.deleted_count,
         "notifs_deleted":   notifs_result.deleted_count,
         "admins_deleted":   admins_result.deleted_count,
+        "batches_deleted":  batches_result.deleted_count, 
     }
     print(
         f"🗑️  Cascade gym delete → {gym_id} | "
@@ -473,6 +478,7 @@ def _cascade_delete_gym(gym_id: str) -> dict:
         f"scans={summary['scans_deleted']} user_ids={summary['user_ids_deleted']} "
         f"invoices={summary['invoices_deleted']} banners={summary['banners_deleted']} "
         f"notifs={summary['notifs_deleted']} admins={summary['admins_deleted']}",
+        f"batches={summary['batches_deleted']}", 
         flush=True,
     )
     return summary
@@ -1175,6 +1181,23 @@ class GymAdminResetPasswordRequest(BaseModel):
     reset_token:  str
     new_password: str
 
+# ── Pydantic models — add near your other model definitions ─────────────────
+class BatchCreate(BaseModel):
+    name:         str
+    time:         str            # e.g. "6:00 – 7:30 AM"
+    days_label:   str            # e.g. "Mon · Wed · Fri"
+    trainer_name: str
+    capacity:     int = 20
+    member_count: int = 0
+
+class BatchUpdate(BaseModel):
+    name:         Optional[str] = None
+    time:         Optional[str] = None
+    days_label:   Optional[str] = None
+    trainer_name: Optional[str] = None
+    capacity:     Optional[int] = None
+    member_count: Optional[int] = None
+
 # ── NEW: Workout Access lock (gym admin toggles per-member Plans visibility) ─
 class WorkoutLockUpdate(BaseModel):
     locked: bool
@@ -1350,6 +1373,65 @@ def gym_admin_reset_password(req: GymAdminResetPasswordRequest):
 
     print(f"✅  Gym-admin password reset completed → {email}", flush=True)
     return {"status": "ok", "message": "Password reset successful. Please sign in."}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ROUTES — BATCHES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/gym/{gym_id}/batches")
+def create_batch(gym_id: str, req: BatchCreate):
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    if not req.name.strip():
+        raise HTTPException(400, "Batch name is required")
+
+    batch_id = str(uuid.uuid4())
+    doc = {
+        "batch_id":     batch_id,
+        "gym_id":       gym_id,
+        "name":         req.name.strip(),
+        "time":         req.time.strip(),
+        "days_label":   req.days_label.strip(),
+        "trainer_name": req.trainer_name.strip(),
+        "capacity":     max(1, req.capacity),
+        "member_count": max(0, req.member_count),
+        "created_at":   datetime.now(timezone.utc),
+    }
+    col_batches.insert_one(doc)
+    print(f"✅  Batch created → {batch_id}  gym={gym_id}  '{req.name}'", flush=True)
+    return {"status": "created", "batch_id": batch_id}
+
+@app.get("/gym/{gym_id}/batches")
+def list_batches(gym_id: str):
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    docs = list(col_batches.find({"gym_id": gym_id}).sort("created_at", DESCENDING))
+    return [_doc(d) for d in docs]
+
+@app.patch("/gym/{gym_id}/batches/{batch_id}")
+def update_batch(gym_id: str, batch_id: str, req: BatchUpdate):
+    batch = col_batches.find_one({"batch_id": batch_id, "gym_id": gym_id})
+    if not batch:
+        raise HTTPException(404, "Batch not found for this gym")
+
+    update: dict = {}
+    if req.name         is not None: update["name"]         = req.name.strip()
+    if req.time         is not None: update["time"]         = req.time.strip()
+    if req.days_label   is not None: update["days_label"]   = req.days_label.strip()
+    if req.trainer_name is not None: update["trainer_name"] = req.trainer_name.strip()
+    if req.capacity     is not None: update["capacity"]     = max(1, req.capacity)
+    if req.member_count is not None: update["member_count"] = max(0, req.member_count)
+
+    if update:
+        col_batches.update_one({"batch_id": batch_id, "gym_id": gym_id}, {"$set": update})
+    return {"status": "updated", "batch_id": batch_id}
+
+@app.delete("/gym/{gym_id}/batches/{batch_id}")
+def delete_batch(gym_id: str, batch_id: str):
+    result = col_batches.delete_one({"batch_id": batch_id, "gym_id": gym_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Batch not found or belongs to a different gym")
+    return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — PLATFORM STATS
