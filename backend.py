@@ -172,6 +172,9 @@ col_apple_transactions.create_index("transaction_id", unique=True)
 col_apple_transactions.create_index("email")
 col_agreements.create_index("gym_id", unique=True)
 col_agreements.create_index("agreement_id", unique=True)
+col_trainers: Collection = mdb["gym_trainers"]
+col_trainers.create_index([("gym_id", 1), ("created_at", DESCENDING)])
+col_trainers.create_index("trainer_id", unique=True)
 # ── NEW: gym-admin reset indexes ─────────────────────────────────────────────
 col_gym_admin_resets.create_index("email")
 col_gym_admin_resets.create_index("expires_at")
@@ -458,6 +461,7 @@ def _cascade_delete_gym(gym_id: str) -> dict:
     notifs_result = col_notifs.delete_many({"gym_id": gym_id})
     admins_result = col_gym_admins.delete_many({"gym_id": gym_id})
     batches_result = col_batches.delete_many({"gym_id": gym_id})
+    trainers_result = col_trainers.delete_many({"gym_id": gym_id})
     col_gyms.delete_one({"gym_id": gym_id})
 
     summary = {
@@ -1181,6 +1185,20 @@ class GymAdminResetPasswordRequest(BaseModel):
     reset_token:  str
     new_password: str
 
+class TrainerCreate(BaseModel):
+    name:            str
+    specialty:       str
+    experience_years: int = 0
+    phone:           str = ""
+    certifications:  list[str] = []
+
+class TrainerUpdate(BaseModel):
+    name:             Optional[str]       = None
+    specialty:        Optional[str]       = None
+    experience_years: Optional[int]       = None
+    phone:            Optional[str]       = None
+    certifications:   Optional[list[str]] = None
+
 # ── Pydantic models — add near your other model definitions ─────────────────
 class BatchCreate(BaseModel):
     name:         str
@@ -1373,6 +1391,59 @@ def gym_admin_reset_password(req: GymAdminResetPasswordRequest):
 
     print(f"✅  Gym-admin password reset completed → {email}", flush=True)
     return {"status": "ok", "message": "Password reset successful. Please sign in."}
+
+@app.post("/gym/{gym_id}/trainers")
+def create_trainer(gym_id: str, req: TrainerCreate):
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    if not req.name.strip():
+        raise HTTPException(400, "Trainer name is required")
+
+    trainer_id = str(uuid.uuid4())
+    doc = {
+        "trainer_id":       trainer_id,
+        "gym_id":           gym_id,
+        "name":             req.name.strip(),
+        "specialty":        req.specialty.strip(),
+        "experience_years": max(0, req.experience_years),
+        "phone":            req.phone.strip(),
+        "certifications":   [c.strip() for c in req.certifications if c.strip()],
+        "created_at":       datetime.now(timezone.utc),
+    }
+    col_trainers.insert_one(doc)
+    print(f"✅  Trainer created → {trainer_id}  gym={gym_id}  '{req.name}'", flush=True)
+    return {"status": "created", "trainer_id": trainer_id}
+
+@app.get("/gym/{gym_id}/trainers")
+def list_trainers(gym_id: str):
+    if not col_gyms.find_one({"gym_id": gym_id}):
+        raise HTTPException(404, "Gym not found")
+    docs = list(col_trainers.find({"gym_id": gym_id}).sort("created_at", DESCENDING))
+    return [_doc(d) for d in docs]
+
+@app.patch("/gym/{gym_id}/trainers/{trainer_id}")
+def update_trainer(gym_id: str, trainer_id: str, req: TrainerUpdate):
+    trainer = col_trainers.find_one({"trainer_id": trainer_id, "gym_id": gym_id})
+    if not trainer:
+        raise HTTPException(404, "Trainer not found for this gym")
+
+    update: dict = {}
+    if req.name             is not None: update["name"]             = req.name.strip()
+    if req.specialty        is not None: update["specialty"]        = req.specialty.strip()
+    if req.experience_years is not None: update["experience_years"] = max(0, req.experience_years)
+    if req.phone            is not None: update["phone"]            = req.phone.strip()
+    if req.certifications   is not None: update["certifications"]   = [c.strip() for c in req.certifications if c.strip()]
+
+    if update:
+        col_trainers.update_one({"trainer_id": trainer_id, "gym_id": gym_id}, {"$set": update})
+    return {"status": "updated", "trainer_id": trainer_id}
+
+@app.delete("/gym/{gym_id}/trainers/{trainer_id}")
+def delete_trainer(gym_id: str, trainer_id: str):
+    result = col_trainers.delete_one({"trainer_id": trainer_id, "gym_id": gym_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Trainer not found or belongs to a different gym")
+    return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — BATCHES
