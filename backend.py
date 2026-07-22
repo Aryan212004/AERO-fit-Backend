@@ -1217,8 +1217,13 @@ class BatchUpdate(BaseModel):
     member_count: Optional[int] = None
 
 # ── NEW: Workout Access lock (gym admin toggles per-member Plans visibility) ─
+# ── Extend existing model ────────────────────────────────────────────────────
 class WorkoutLockUpdate(BaseModel):
     locked: bool
+    trainer_id: Optional[str] = None   # required when unlocking (locked=False)
+
+class FitnessPlanUpdate(BaseModel):
+    fitness_plan_text: str
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
@@ -1443,6 +1448,15 @@ def delete_trainer(gym_id: str, trainer_id: str):
     result = col_trainers.delete_one({"trainer_id": trainer_id, "gym_id": gym_id})
     if result.deleted_count == 0:
         raise HTTPException(404, "Trainer not found or belongs to a different gym")
+    # Unassign from any member holding this trainer, and re-lock them so
+    # they can't stay unlocked with a dangling trainer reference.
+    col_users.update_many(
+        {"gym_id": gym_id, "assigned_trainer_id": trainer_id},
+        {"$set": {"workout_plans_locked": True},
+         "$unset": {"assigned_trainer_id": "", "assigned_trainer_name": "",
+                    "assigned_trainer_specialty": "", "assigned_trainer_experience": "",
+                    "assigned_trainer_phone": "", "assigned_trainer_certs": ""}},
+    )
     return {"status": "deleted"}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1839,7 +1853,6 @@ def pro_activation_create_order(gym_id: str):
 #  ROUTES — WORKOUT ACCESS (gym admin locks/unlocks the Workout Plans screen
 #  for individual members; Batches and Trainers are never affected)
 # ══════════════════════════════════════════════════════════════════════════════
-
 @app.get("/gym/{gym_id}/members")
 def list_members(gym_id: str):
     if not col_gyms.find_one({"gym_id": gym_id}):
@@ -1850,6 +1863,9 @@ def list_members(gym_id: str):
             "email": d["email"],
             "name": d.get("name", ""),
             "workout_plans_locked": d.get("workout_plans_locked", False),
+            "assigned_trainer_id":   d.get("assigned_trainer_id"),
+            "assigned_trainer_name": d.get("assigned_trainer_name", ""),
+            "fitness_plan_text":     d.get("fitness_plan_text", ""),
         }
         for d in docs
     ]
@@ -1861,15 +1877,69 @@ def set_workout_lock(gym_id: str, email: str, req: WorkoutLockUpdate):
     if not member:
         raise HTTPException(404, "Member not found for this gym")
 
-    col_users.update_one(
-        {"email": email},
-        {"$set": {
-            "workout_plans_locked": req.locked,
-            "updated_at":           datetime.now(timezone.utc),
-        }},
-    )
+    update = {
+        "workout_plans_locked": req.locked,
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    # Unlocking requires assigning a trainer at the same time.
+    if not req.locked:
+        if not req.trainer_id:
+            raise HTTPException(400, "A trainer must be assigned before unlocking Workout Plans")
+        trainer = col_trainers.find_one({"trainer_id": req.trainer_id, "gym_id": gym_id})
+        if not trainer:
+            raise HTTPException(404, "Trainer not found for this gym")
+        update.update({
+            "assigned_trainer_id":         trainer["trainer_id"],
+            "assigned_trainer_name":       trainer["name"],
+            "assigned_trainer_specialty":  trainer.get("specialty", ""),
+            "assigned_trainer_experience": trainer.get("experience_years", 0),
+            "assigned_trainer_phone":      trainer.get("phone", ""),
+            "assigned_trainer_certs":      trainer.get("certifications", []),
+        })
+
+    col_users.update_one({"email": email}, {"$set": update})
     print(f"✅  Workout Plans {'locked' if req.locked else 'unlocked'} → {email}  gym={gym_id}", flush=True)
     return {"email": email, "workout_plans_locked": req.locked}
+
+
+@app.patch("/gym/{gym_id}/members/{email}/fitness-plan")
+def set_fitness_plan(gym_id: str, email: str, req: FitnessPlanUpdate):
+    email = email.strip().lower()
+    member = col_users.find_one({"email": email, "gym_id": gym_id})
+    if not member:
+        raise HTTPException(404, "Member not found for this gym")
+    col_users.update_one(
+        {"email": email},
+        {"$set": {"fitness_plan_text": req.fitness_plan_text.strip(), "fitness_plan_updated_at": datetime.now(timezone.utc)}},
+    )
+    return {"status": "updated", "email": email}
+
+
+@app.get("/user/{email}/workout-plan-info")
+def get_workout_plan_info(email: str):
+    """Flutter app polls this — locked state + assigned trainer + admin's fitness plan text."""
+    user = col_users.find_one({"email": email.strip().lower()})
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    locked = bool(user.get("workout_plans_locked", False))
+    trainer = None
+    if user.get("assigned_trainer_id"):
+        trainer = {
+            "trainer_id":       user.get("assigned_trainer_id"),
+            "name":             user.get("assigned_trainer_name", ""),
+            "specialty":        user.get("assigned_trainer_specialty", ""),
+            "experience_years": user.get("assigned_trainer_experience", 0),
+            "phone":            user.get("assigned_trainer_phone", ""),
+            "certifications":   user.get("assigned_trainer_certs", []),
+        }
+
+    return {
+        "locked":            locked,
+        "trainer":           trainer,
+        "fitness_plan_text": user.get("fitness_plan_text", ""),
+    }
 
 # Lightweight — this is the one the Flutter app polls
 @app.get("/user/{email}/workout-access")
