@@ -950,7 +950,7 @@ print("✅  Background threads started (keep-alive + expiry job + pro billing jo
 #  FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AERO-FIT API", version="20.1.2")
+app = FastAPI(title="AERO-FIT API", version="20.2.0")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
@@ -1233,7 +1233,7 @@ class FitnessPlanUpdate(BaseModel):
 def health():
     return {
         "status":         "ok",
-        "version":        "20.1.2",
+        "version":        "20.2.0",
         "db":             "mongodb",
         "ai":             GEMINI_MDL_PRIMARY,
         "max_concurrent": MAX_CONCURRENT_SCANS,
@@ -1852,6 +1852,13 @@ def pro_activation_create_order(gym_id: str):
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — WORKOUT ACCESS (gym admin locks/unlocks the Workout Plans screen
 #  for individual members; Batches and Trainers are never affected)
+#
+#  IMPORTANT: the safe default is LOCKED. Every place in this file that
+#  reads `workout_plans_locked` from a user doc falls back to True (locked)
+#  when the field is missing, and /admin/add-user now writes the field
+#  explicitly at registration time so no gym member is ever silently
+#  unlocked. Only an explicit admin unlock (which requires assigning a
+#  trainer) sets it to False.
 # ══════════════════════════════════════════════════════════════════════════════
 @app.get("/gym/{gym_id}/members")
 def list_members(gym_id: str):
@@ -1862,7 +1869,7 @@ def list_members(gym_id: str):
         {
             "email": d["email"],
             "name": d.get("name", ""),
-            "workout_plans_locked": d.get("workout_plans_locked", False),
+            "workout_plans_locked": d.get("workout_plans_locked", True),  # default: LOCKED
             "assigned_trainer_id":   d.get("assigned_trainer_id"),
             "assigned_trainer_name": d.get("assigned_trainer_name", ""),
             "fitness_plan_text":     d.get("fitness_plan_text", ""),
@@ -1923,7 +1930,9 @@ def get_workout_plan_info(email: str):
     if not user:
         raise HTTPException(404, "User not found")
 
-    locked = bool(user.get("workout_plans_locked", False))
+    # Default LOCKED when the field is missing (e.g. legacy accounts created
+    # before this field existed, or any other gap) — never default-open.
+    locked = bool(user.get("workout_plans_locked", True))
     trainer = None
     if user.get("assigned_trainer_id"):
         trainer = {
@@ -1947,7 +1956,8 @@ def get_workout_access(email: str):
     user = col_users.find_one({"email": email.strip().lower()})
     if not user:
         raise HTTPException(404, "User not found")
-    return {"locked": bool(user.get("workout_plans_locked", False))}
+    # Default LOCKED when the field is missing — see note above.
+    return {"locked": bool(user.get("workout_plans_locked", True))}
 
 @app.post("/gym/{gym_id}/pro-activation/reset-order")
 def pro_activation_reset_order(gym_id: str, req: AlphaLogin):
@@ -2748,6 +2758,15 @@ def add_user(req: AddUserRequest):
         col_gyms.update_one({"gym_id": gym_id}, {"$inc": {"members": 1}})
 
     hashed = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode()
+
+    # ── Workout Plans lock — LOCKED BY DEFAULT for every new gym member. ───────
+    # Independent (indie) users have no gym affiliation and never see the
+    # Workout Plans / Batches / Trainers toggle in the app, so the flag is
+    # irrelevant for them; we still write `True` for consistency so no code
+    # path can ever end up treating a missing field as "unlocked".
+    # The gym admin must explicitly unlock via
+    # PATCH /gym/{gym_id}/members/{email}/workout-lock, which also requires
+    # assigning a trainer at the same time.
     col_users.insert_one({
         "email":              email,
         "name":               req.name.strip(),
@@ -2759,6 +2778,7 @@ def add_user(req: AddUserRequest):
         "plan_label":         plan_label,
         "indie_plan":         False,
         "membership_expired": False,
+        "workout_plans_locked": True,
         "created_at":         datetime.now(timezone.utc),
     })
     return {"status": "created", "email": email, "plan_months": plan_months, "plan_label": plan_label}
