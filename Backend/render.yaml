@@ -2,5 +2,6 @@ services:
   - type: web
     name: aero-fit-backend
     runtime: python
+    rootDir: Backend
     buildCommand: pip install --no-cache-dir -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn Backend:app --host 0.0.0.0 --port $PORT
