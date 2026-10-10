@@ -1225,6 +1225,14 @@ class WorkoutLockUpdate(BaseModel):
 class FitnessPlanUpdate(BaseModel):
     fitness_plan_text: str
 
+class AlphaIndieUserCreate(BaseModel):
+    email:     str
+    password:  str
+    name:      Optional[str] = ""
+    months:    int           = 1
+    weight_kg: float         = 70.0
+    height_cm: float         = 170.0
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1272,6 +1280,52 @@ def gym_admin_login(req: AdminLogin):
         "gym_name": adm["gym_name"],
         "name":     adm["name"],
         "email":    adm["email"],
+    }
+
+@app.post("/alpha/indie-users")
+def alpha_create_indie_user(req: AlphaIndieUserCreate):
+    email = req.email.strip().lower()
+    if not re.match(r"^[\w\.-]+@[\w\.-]+\.\w{2,}$", email):
+        raise HTTPException(400, "Invalid email address")
+
+    password = req.password.strip()
+    if len(password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+
+    if col_users.find_one({"email": email}):
+        raise HTTPException(409, "An account with this email already exists")
+
+    months     = max(1, min(req.months, 12))
+    now        = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=30 * months)
+    name       = (req.name or "").strip() or email.split("@")[0]
+    hashed     = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    col_users.insert_one({
+        "email":                email,
+        "name":                 name,
+        "password":             hashed,
+        "weight_kg":            req.weight_kg if req.weight_kg > 0 else 70.0,
+        "height_cm":            req.height_cm if req.height_cm > 0 else 170.0,
+        "gym_id":               None,
+        "plan_months":          months,
+        "plan_label":           f"{months} Month{'s' if months > 1 else ''}",
+        "indie_plan":           True,
+        "indie_expires_at":     expires_at,
+        "membership_expired":   False,
+        "workout_plans_locked": True,
+        "created_at":           now,
+        "payment_platform":     "manual",
+        "created_by":           "alpha",
+    })
+
+    print(f"✅  Indie user created manually by alpha admin → {email}  {months}mo", flush=True)
+    return {
+        "status":     "created",
+        "email":      email,
+        "name":       name,
+        "months":     months,
+        "expires_at": expires_at.isoformat(),
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
